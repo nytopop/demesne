@@ -4,20 +4,21 @@ use std::path::PathBuf;
 fn main() {
     let mut conf = cmake::Config::new("llama.cpp");
 
-    conf.build_target("preinstall")
-        .define("BUILD_SHARED_LIBS", "false")
+    conf.build_target("llama")
+        .define("BUILD_SHARED_LIBS", "OFF")
         .define("LLAMA_STATIC", "OFF")
-        // FIXME: this will blow up
-        .define("LLAMA_NATIVE", "ON")
+        .define("LLAMA_NATIVE", "ON") // FIXME
         .define("LLAMA_LTO", "OFF")
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
-        .define("LLAMA_BUILD_SERVER", "OFF");
+        .define("LLAMA_BUILD_SERVER", "OFF")
+        .very_verbose(true);
 
     // cpu features
     let on = |x| if x { "ON" } else { "OFF" };
     conf.define("LLAMA_AVX", on(cfg!(target_feature = "avx")));
     conf.define("LLAMA_AVX2", on(cfg!(target_feature = "avx2")));
+    // TODO: avx512_*** and the cpu HBM stuff
     conf.define("LLAMA_FMA", on(cfg!(target_feature = "fma")));
 
     #[cfg(feature = "force_mmq")]

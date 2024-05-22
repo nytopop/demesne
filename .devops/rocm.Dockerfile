@@ -15,7 +15,7 @@ workdir /app
 
 copy . .
 
-env CC=/opt/rocm/llvm/bin/clang CXX=/opt/rocm/llvm/bin/clang++ RUSTFLAGS="-C target-cpu=native"
+env RUSTFLAGS="-C target-cpu=native"
 
 run --mount=type=cache,target=/target cargo build --release --features rocm --target-dir /target \
  && cp /target/release/demesne /bin/demesne
