@@ -1,0 +1,17 @@
+[package]
+name    = "llama_sys"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+rocm      = []
+cuda      = []
+force_mmq = []
+
+[build-dependencies]
+cmake   = "0.1.50"
+bindgen = "0.69.4"
+
+[dependencies]
+smart-default = "0.7.1"
+thiserror     = "1.0.61"
