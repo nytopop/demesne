@@ -10,6 +10,7 @@ use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::Format;
 
 mod openai;
+mod radix;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "demesne")]
@@ -26,17 +27,17 @@ struct Opts {
     #[structopt(short = "m", long = "model", name = "path")]
     model_path: PathBuf,
 
-    /// kv cache size in tokens
+    /// cache size in tokens
     #[structopt(short = "c", long = "cache", default_value = "32768")]
     n_cache: usize,
 
-    /// max batch size in tokens
+    /// batch size in tokens
     #[structopt(short = "b", long = "batch", default_value = "256")]
     n_batch: usize,
 
-    /// number of layers to offload to gpu
-    #[structopt(short = "l", long = "layers", name = "layers", default_value = "512")]
-    n_gpu_layers: usize,
+    /// number of layers to offload to gpu (-1 = offload all)
+    #[structopt(short = "l", long = "layers", name = "layers", default_value = "-1")]
+    n_gpu_layers: isize,
 
     /// use flash attention
     #[structopt(short = "f", long = "flash-attn")]
@@ -71,14 +72,22 @@ async fn main() -> Result<(), rocket::Error> {
     );
 
     let m = ModelParams::default()
-        .n_gpu_layers(o.n_gpu_layers)
+        .n_gpu_layers(if o.n_gpu_layers < 0 {
+            32768
+        } else {
+            o.n_gpu_layers as usize
+        })
         .use_mmap(o.mmap)
         .check_tensors(true);
+
+    let n_cpu = num_cpus::get_physical();
 
     let c = ContextParams::default()
         .n_ctx(o.n_cache)
         .n_batch(o.n_batch)
         .n_ubatch(o.n_batch)
+        .n_threads(n_cpu)
+        .n_threads_batch(n_cpu)
         .flash_attn(o.flash_attn)
         .defrag_threshold(0.1);
 
@@ -89,11 +98,12 @@ async fn main() -> Result<(), rocket::Error> {
     };
 
     // TODO: api key
+    // TODO: limits by api key
 
     rocket::custom(config)
         .manage(openai::Api::load(o.model_path, m, c).unwrap())
-        .register("/", openai::catchers())
-        .mount("/", openai::routes())
+        .register("/", catchers![openai::catch])
+        .mount("/", routes![openai::completions])
         .launch()
         .await?;
 

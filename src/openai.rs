@@ -1,117 +1,252 @@
+#![allow(dead_code)]
 use std::cmp::min;
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::{iter, mem};
 
 use either::Either;
 use futures::channel::mpsc::{self, Receiver, Sender};
+use futures::channel::oneshot;
 use futures::sink::SinkExt;
-use llama_sys::sampling::Logits;
-use llama_sys::{Context, ContextParams, EvalReq, Model, ModelParams, SeqId, Token, Tokenizer};
-use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
+use llama_sys::sampling::{Chain, Choice, Logits, Sample};
+use llama_sys::{Context, ContextParams, Model, ModelParams, Token, Tokenizer};
 use rocket::http::Status;
 use rocket::response::stream::{Event, EventStream};
-use rocket::response::Responder;
 use rocket::serde::json::{json, Json, Value};
 use rocket::serde::Deserialize;
 use rocket::tokio::task::{spawn_blocking, JoinHandle};
-use rocket::{Catcher, Request, Route, State};
+use rocket::{Request, State};
 use serde_json::Map;
+use validator::Validate;
 
-pub fn catchers() -> Vec<Catcher> {
-    #[catch(default)]
-    fn default(status: Status, _: &Request) -> Fail {
-        fail(status, "unknown")
-    }
-
-    catchers![default]
-}
-
-pub fn routes() -> Vec<Route> {
-    routes![completions, speech, transcriptions]
-}
+use super::radix::{Kv, RadixKv};
 
 type Fail = (Status, Json<Value>);
+
+type FailR<T> = Result<T, Fail>;
+
+#[catch(default)]
+pub fn catch(status: Status, _: &Request) -> Fail {
+    fail(status, "unknown")
+}
 
 fn fail(status: Status, reason: &str) -> Fail {
     (status, Json(json! {{"reason": reason}}))
 }
 
-#[derive(Deserialize)]
-struct Message<'a> {
-    role: &'a str,
-    content: &'a str,
+#[derive(Deserialize, Validate)]
+pub struct CompletionReq<'a> {
+    #[serde(borrow)]
+    messages: Vec<Message<'a>>,
+
+    max_tokens: Option<u32>, // default input-cx; # of tokens to infer
+
+    #[validate(range(min = 1))]
+    n: Option<u32>, // default 1; # of completion choices
+
+    #[validate(range(min = 0., max = 2.))]
+    temperature: Option<f32>, // default 1
+
+    #[validate(range(min = 0., max = 1.))]
+    top_p: Option<f32>, // default NONE
+
+    #[validate(range(min = -2., max = 2.))]
+    frequency_penalty: Option<f32>, // default NONE
+
+    #[validate(range(min = -2., max = 2.))]
+    presence_penalty: Option<f32>, // default NONE
+
+    // NOTE(valid): vals must be (-100, 100)
+    logit_bias: Option<HashMap<Token, f32>>,
+
+    #[serde(default)]
+    logprobs: bool,
+
+    #[validate(range(min = 0, max = 20))]
+    top_logprobs: Option<u32>, // default NONE; requires logprobs
+
+    #[serde(default)]
+    response_format: Format,
+
+    stop: Option<Stop<'a>>,
+
+    tools: Option<Vec<Tool<'a>>>,
+
+    tool_choice: Option<ToolChoice<'a>>, // default "auto"
+
+    stream: Option<bool>, // default false
 }
 
-type Completion = Either<Json<Value>, EventStream<Receiver<Event>>>;
+#[derive(Deserialize)]
+#[serde(tag = "role")]
+#[rustfmt::skip]
+enum Message<'a> {
+    #[serde(rename = "system")]
+    System { content: &'a str, name: Option<&'a str> },
 
-#[post("/v1/chat/completions", format = "json", data = "<req>")]
-async fn completions(api: &State<Api>, req: Json<Map<String, Value>>) -> Result<Completion, Fail> {
-    let req = req.into_inner();
+    #[serde(rename = "user")]
+    User { content: &'a str, name: Option<&'a str> },
+
+    #[serde(rename = "assistant")]
+    Assistant { content: &'a str, name: Option<&'a str>, tool_calls: Option<Call<'a>> },
+
+    #[serde(rename = "tool")]
+    Tool { content: &'a str, tool_call_id: &'a str },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum Call<'a> {
+    #[serde(rename = "function")]
+    Function { id: &'a str, function: Function<'a> },
+}
+
+#[derive(Deserialize)]
+struct Function<'a> {
+    name: &'a str,
+    arguments: &'a str,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(tag = "type")]
+enum Format {
+    #[default]
+    #[serde(rename = "text")]
+    Text,
+
+    #[serde(rename = "json_object")]
+    JsonObject,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Stop<'a> {
+    String(&'a str),
+
+    On(Vec<&'a str>),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum Tool<'a> {
+    Function {
+        description: Option<&'a str>,
+        name: &'a str,
+        parameters: Option<Map<String, Value>>,
+    },
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type")]
+enum ToolChoice<'a> {
+    #[serde(rename = "function")]
+    Function { name: &'a str },
+
+    #[serde(untagged)]
+    Tool(&'a str), // "none" | "auto" | "required"
+}
+
+type Completion = Result<Either<Json<Value>, EventStream<Receiver<Event>>>, Fail>;
+
+#[post("/v1/chat/completions", format = "json", data = "<body>")]
+pub async fn completions(api: &State<Api>, body: Json<CompletionReq<'_>>) -> Completion {
+    let body = body.into_inner();
+
+    body.validate()
+        .map_err(|e| Json(serde_json::to_value(e).unwrap()))
+        .map_err(|e| (Status::BadRequest, e))?;
 
     let api = api.inner();
     let mut tokens = vec![];
 
-    // TODO(templates): pull jinjas
-    for msg in from_json_key::<Vec<Message>>(&req, "messages")? {
-        let msg = format!("{}: {}\n", msg.role, msg.content);
-        api.tk.tokenize(&mut tokens, &msg, false, false);
+    for msg in body.messages {
+        // TODO(templates): pull jinjas
+        match msg {
+            // hmmmdge... not super great on mistral variants
+            Message::System { content, name } => {}
+
+            // should be supported by p much everything?
+            Message::User { content, name } => {}
+
+            // this has tool_calls because it might trigger a tc
+            Message::Assistant { content, name, tool_calls } => {}
+
+            // this is how you give it the result of said tool call
+            Message::Tool { content, tool_call_id } => {}
+        }
+
+        // let msg = format!("{}: {}\n", msg.role, msg.content);
+        // api.tk.tokenize(&mut tokens, &msg, false, false);
     }
 
     if tokens.len() >= api.max_n {
         return Err(fail(Status::InsufficientStorage, "too many tokens :("));
     }
 
-    let params = Params { tx: Either::Left(()) };
-    api.schedule(tokens, params).await?;
+    let chain = Chain::sample();
 
-    // TODO: streaming vs not streaming
+    if body.stream.unwrap_or(false) {
+        let (params, recv) = Params::streaming(chain);
+        api.schedule(tokens, params).await?;
 
-    Ok(Either::Left(Json(json! {{"output": "woo"}})))
+        Ok(Either::Right(EventStream::from(recv)))
+    } else {
+        let (params, recv) = Params::unary(chain);
+        api.schedule(tokens, params).await?;
+
+        let body = recv
+            .await
+            .map_err(|_| fail(Status::InternalServerError, "unknown"))?;
+
+        Ok(Either::Left(body))
+    }
 }
 
-fn from_json_key<'de, T: Deserialize<'de>>(r: &'de Map<String, Value>, k: &str) -> Result<T, Fail> {
-    let val = r.get(k).ok_or_else(|| {
-        let err = format!("missing {k:?} in request");
-        fail(Status::BadRequest, &err)
-    })?;
-
-    T::deserialize(val).map_err(|e| {
-        let err = format!("invalid {k:?} in request: {e:?}");
-        fail(Status::BadRequest, &err)
-    })
-}
-
-// TODO: stop conds and all the other crap
+// TODO: time 2 restructure
 struct Params {
-    tx: Either<(), ()>,
+    tx: Either<oneshot::Sender<Json<Value>>, Sender<Event>>,
+    chain: Chain<Sample>,
 }
 
-#[derive(Responder)]
-enum Speech {} // stt
+impl Params {
+    fn unary(chain: Chain<Sample>) -> (Self, oneshot::Receiver<Json<Value>>) {
+        let (tx, rx) = oneshot::channel();
+        let tx = Either::Left(tx);
+        let p = Self { tx, chain };
 
-#[post("/v1/audio/speech", format = "json", data = "<req>")]
-async fn speech(api: &State<Api>, req: Json<Value>) -> Result<Speech, Fail> {
-    let _ = (api, req);
-    unimplemented!()
-}
+        (p, rx)
+    }
 
-#[derive(Responder)]
-enum Transcription {} // tts
+    fn streaming(chain: Chain<Sample>) -> (Self, Receiver<Event>) {
+        let (tx, rx) = mpsc::channel(32);
+        let tx = Either::Right(tx);
+        let p = Self { tx, chain };
 
-#[post("/v1/audio/transcriptions", format = "json", data = "<req>")]
-async fn transcriptions(api: &State<Api>, req: Json<Value>) -> Result<Transcription, Fail> {
-    let _ = (api, req);
-    unimplemented!()
+        (p, rx)
+    }
+
+    fn sample(&mut self, ctx: &mut Context, logits: &mut Logits) -> Option<Token> {
+        let token = self.chain.choose(ctx, logits);
+
+        // TODO: actually send a response back or w/e
+
+        if ctx.model().token_is_eog(token) {
+            return None;
+        }
+
+        Some(token)
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("failed to load model")]
     LoadModel,
+
     #[error("failed to allocate context")]
     LoadContext,
+
     #[error("decode error: {0:?}")]
     Decode(#[from] llama_sys::DecodeError),
 }
@@ -180,284 +315,69 @@ impl Inner {
             self.sched.push(span);
         }
 
+        // decode a batch of pending tokens
         let bounds: Vec<_> = (self.sched.iter())
-            .map(|(s, _)| (s.len(), self.cache.ancestor(s).1))
+            .map(|(s, _)| s.len() - self.cache.ancestor(s).1)
             .collect();
 
-        // TODO: may need to remove this to implement limits
-        let budget = clamp_sum(self.n_batch, &bounds, |&(nt, nc)| nt - nc);
-        let mut gc = vec![];
+        // TODO: we should distribute total cache size amongst all requests
+        let budget = clamp_sum(self.n_batch, &bounds, |&n| n);
 
-        for (j, ((n_tokens, n_cached), k_alloc)) in iter::zip(bounds, budget).enumerate() {
-            let (tokens, params) = &mut self.sched[j];
-
-            if n_tokens == n_cached {
-                let logits = self.cache.logits_mut(tokens).unwrap();
-                // TODO: sampler + decision logic there
-                // TODO: make sure it extends by vec and gets full history
-                // we're just gonna ignore that it bumps batch sizes (llama_sys handles it np)
-                gc.push(j);
+        for (i, q_alloc) in budget.into_iter().enumerate() {
+            if q_alloc == 0 {
                 continue;
             }
 
-            if k_alloc == 0 {
-                continue;
-            }
+            let tokens = &self.sched[i].0;
+            let (_, n_cached, _) = self.cache.ancestor(tokens);
+            let len = (n_cached + q_alloc).min(tokens.len());
 
-            let len = n_cached + k_alloc;
-            // TODO: use ret val to track stats
+            println!(
+                "{i}: n_cached={n_cached}, q_alloc={q_alloc}, len={}, taking={}",
+                tokens.len(),
+                len - n_cached,
+            );
+
             self.cache.insert_cold(&mut self.ctx, &tokens[..len]);
         }
 
-        // TODO: generate the set of prefixes that cannot be deleted (it's just self.sched)
-
-        for j in gc.into_iter().rev() {
-            self.sched.remove(j);
-        }
-
         let batch = self.cache.pending_batch();
-        // TODO: we need to handle the no kv slot case properlike
         let evals = self.ctx.decode_tokens(&batch)?;
 
-        // TODO: activations
         let logits: Vec<_> = evals.into_iter().filter_map(|e| e.logits).collect();
         let act = vec![vec![]; logits.len()];
 
         self.cache.accept_batch(iter::zip(logits, act));
+        self.cache.compact();
 
-        println!(
-            "radix_kv: {:?}",
-            (self.cache.g.edge_count(), self.cache.g.node_count())
-        );
+        // sample on any spans
+        let mut gc = vec![];
+
+        for (i, (span, params)) in self.sched.iter_mut().enumerate() {
+            let (j, n_cached, _) = self.cache.ancestor(span);
+
+            if n_cached < span.len() {
+                continue;
+            }
+
+            // TODO: if no logits, do the thing
+            let logits = match &mut self.cache[j].state {
+                Kv::Hot(logits, _) => logits,
+                s => panic!("{s:?}"),
+            };
+
+            if let Some(token) = params.sample(&mut self.ctx, logits) {
+                span.push(token);
+            } else {
+                gc.push(i);
+            }
+        }
+
+        for i in gc.into_iter().rev() {
+            self.sched.remove(i);
+        }
 
         Ok(())
-    }
-}
-
-#[derive(Default)]
-struct RadixKv {
-    g: DiGraph<Span, ()>,
-    root: NodeIndex,
-}
-
-#[derive(Debug)]
-struct Span {
-    tag: SeqId,
-    offset: usize,
-    tokens: Vec<Token>,
-    state: Cells,
-}
-
-#[derive(Debug)]
-enum Cells {
-    Hot(Logits, Vec<f32>), // decoded, all data
-    Warm,                  // decoded, no logits
-    Cold,                  // scheduled
-}
-
-impl RadixKv {
-    fn new(tag: SeqId) -> Self {
-        let mut g = DiGraph::new();
-
-        let root = g.add_node(Span {
-            tag,
-            offset: 0,
-            tokens: vec![],
-            state: Cells::Warm,
-        });
-
-        Self { g, root }
-    }
-
-    // (i, n_shared, n_shared_i)
-    pub fn ancestor(&self, mut tokens: &[Token]) -> (NodeIndex, usize, usize) {
-        let (mut i, mut n, mut k) = (self.root, 0, 0);
-
-        loop {
-            n += k;
-
-            if k != self.g[i].tokens.len() {
-                break (i, n, k);
-            }
-
-            tokens = &tokens[k..];
-
-            fn common_prefix<T: Eq>(a: &[T], b: &[T]) -> usize {
-                iter::zip(a, b).take_while(|(a, b)| a == b).count()
-            }
-
-            if let Some((j, p)) = self
-                .g
-                .neighbors(i)
-                .map(|j| (j, common_prefix(&self.g[j].tokens, tokens)))
-                .max_by_key(|(_, p)| *p)
-            {
-                i = j;
-                k = p;
-            } else {
-                break (i, n, k);
-            }
-        }
-    }
-
-    pub fn logits_mut(&mut self, tokens: &[Token]) -> Option<&mut Logits> {
-        let (i, _, _) = self.ancestor(tokens);
-
-        match &mut self.g[i].state {
-            Cells::Hot(logits, _) => Some(logits),
-            _ => None,
-        }
-    }
-
-    // returns Some iff a node was inserted; None is not an error
-    pub fn insert_cold(&mut self, ctx: &mut Context, tokens: &[Token]) -> Option<NodeIndex> {
-        let (i, n, k) = self.ancestor(tokens);
-
-        if tokens.len() == n {
-            return None;
-        }
-
-        if k != self.g[i].tokens.len() {
-            self.split_off(i, k);
-        }
-
-        let node = &self.g[i];
-
-        let tag = if self.g.neighbors(i).next().is_some() {
-            let tag = ctx.kv_cache_unique_id();
-            ctx.kv_cache_seq_cp(node.tag, tag, ..n as i32);
-            tag
-        } else {
-            node.tag
-        };
-
-        let next = Span {
-            tag,
-            offset: node.offset + node.tokens.len(),
-            tokens: tokens[n..].to_vec(),
-            state: Cells::Cold,
-        };
-
-        let j = self.g.add_node(next);
-        self.g.add_edge(i, j, ());
-
-        Some(j)
-    }
-
-    fn split_off(&mut self, src: NodeIndex, at: usize) -> (EdgeIndex, NodeIndex) {
-        let node = &mut self.g[src];
-        let next = node.tokens.split_off(at);
-
-        let state = match &node.state {
-            Cells::Hot(_, _) => Cells::Warm,
-            Cells::Cold => Cells::Cold,
-            Cells::Warm => Cells::Warm,
-        };
-
-        let next = Span {
-            tag: node.tag,
-            offset: node.offset + node.tokens.len(),
-            tokens: next,
-            state: mem::replace(&mut node.state, state),
-        };
-
-        let dst = self.g.add_node(next);
-
-        let mut children = self.g.neighbors(src).detach();
-
-        while let Some((e, c)) = children.next(&self.g) {
-            self.g.remove_edge(e).unwrap();
-            self.g.add_edge(dst, c, ());
-        }
-
-        (self.g.add_edge(src, dst, ()), dst)
-    }
-
-    pub fn pending_batch(&self) -> Vec<EvalReq> {
-        let mut reqs = vec![];
-        let mut fifo = VecDeque::new();
-        fifo.push_back(self.root);
-
-        while let Some(i) = fifo.pop_front() {
-            let tags = self.implied_tags(i);
-            let node = &self.g[i];
-
-            if let Cells::Cold = node.state {
-                let n = node.tokens.len() - 1;
-
-                let it = node
-                    .tokens
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| EvalReq::new(tags.clone(), node.offset + i, *t, i == n));
-
-                reqs.extend(it);
-            }
-
-            fifo.extend(self.g.neighbors(i));
-        }
-
-        reqs
-    }
-
-    fn implied_tags(&self, i: NodeIndex) -> Vec<SeqId> {
-        let mut tags = vec![];
-        let mut fifo = VecDeque::new();
-        fifo.push_back(i);
-
-        while let Some(i) = fifo.pop_front() {
-            tags.push(self.g[i].tag);
-            fifo.extend(self.g.neighbors(i));
-        }
-
-        tags
-    }
-
-    //pub fn accept_batch(&mut self, logits: Vec<Logits>, act: Vec<Vec<f32>>) {
-    pub fn accept_batch<I: IntoIterator<Item = (Logits, Vec<f32>)>>(&mut self, iter: I) {
-        let mut fifo = VecDeque::new();
-        fifo.push_back(self.root);
-
-        // assumption: it's in the same order as when we scheduled pending_batch
-        'outer: for (logits, act) in iter.into_iter() {
-            while let Some(i) = fifo.pop_front() {
-                fifo.extend(self.g.neighbors(i));
-
-                if let Cells::Cold = self.g[i].state {
-                    self.g[i].state = Cells::Hot(logits, act);
-                    continue 'outer;
-                }
-            }
-
-            panic!("o no");
-        }
-
-        fifo.clear();
-        fifo.push_back(self.root);
-
-        // compact the graph by removing any trivial 1 token extension nodes
-        while let Some(i) = fifo.pop_front() {
-            let mut it = self.g.neighbors(i);
-
-            if let (Some(c), None) = (it.next(), it.next()) {
-                if self.g[i].tag == self.g[c].tag {
-                    let mut children = self.g.neighbors(c).detach();
-
-                    while let Some((e, cc)) = children.next(&self.g) {
-                        self.g.remove_edge(e).unwrap();
-                        self.g.add_edge(i, cc, ());
-                    }
-
-                    let mut src = self.g.remove_node(c).unwrap();
-                    let dst = &mut self.g[i];
-
-                    dst.tokens.append(&mut src.tokens);
-                    dst.state = src.state;
-                }
-            }
-
-            fifo.extend(self.g.neighbors(i));
-        }
     }
 }
 
