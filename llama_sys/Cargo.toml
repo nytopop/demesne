@@ -4,14 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-rocm      = []
-cuda      = []
-force_mmq = []
+rocm = []
+cuda = []
 
 [build-dependencies]
 cmake   = "0.1.50"
 bindgen = "0.69.4"
 
 [dependencies]
-smart-default = "0.7.1"
-thiserror     = "1.0.61"
+thiserror = "1.0.61"
+rand      = "0.8.5"

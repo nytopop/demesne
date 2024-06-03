@@ -21,9 +21,6 @@ fn main() {
     // TODO: avx512_*** and the cpu HBM stuff
     conf.define("LLAMA_FMA", on(cfg!(target_feature = "fma")));
 
-    #[cfg(feature = "force_mmq")]
-    conf.define("LLAMA_CUDA_FORCE_MMQ", "ON");
-
     // rocm (amdgpu)
     #[cfg(feature = "rocm")]
     {

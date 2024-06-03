@@ -1,6 +1,3 @@
-#[macro_use]
-extern crate rocket;
-
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -9,7 +6,11 @@ use structopt::StructOpt;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::Format;
 
+#[macro_use]
+extern crate rocket;
+
 mod openai;
+mod prompt;
 mod radix;
 
 #[derive(Debug, StructOpt)]
@@ -103,7 +104,7 @@ async fn main() -> Result<(), rocket::Error> {
     rocket::custom(config)
         .manage(openai::Api::load(o.model_path, m, c).unwrap())
         .register("/", catchers![openai::catch])
-        .mount("/", routes![openai::completions])
+        .mount("/", openai::routes())
         .launch()
         .await?;
 

@@ -1,38 +1,41 @@
-#![allow(dead_code)]
+use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::{iter, mem};
+use std::{iter, mem, str};
 
 use either::Either;
-use futures::channel::mpsc::{self, Receiver, Sender};
-use futures::channel::oneshot;
+use futures::channel::mpsc;
+use futures::channel::oneshot as ones;
 use futures::sink::SinkExt;
-use llama_sys::sampling::{Chain, Choice, Logits, Sample};
+use llama_sys::sampling::{Logit, Output};
 use llama_sys::{Context, ContextParams, Model, ModelParams, Token, Tokenizer};
 use rocket::http::Status;
 use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::{json, Json, Value};
-use rocket::serde::Deserialize;
+use rocket::serde::{Deserialize, Serialize};
 use rocket::tokio::task::{spawn_blocking, JoinHandle};
-use rocket::{Request, State};
+use rocket::{Request, Route, State};
 use serde_json::Map;
 use validator::Validate;
 
-use super::radix::{Kv, RadixKv};
+use super::prompt::Vocab;
+use super::radix::{Radix, RadixKv};
+
+pub fn routes() -> Vec<Route> {
+    routes![chat_completions]
+}
 
 type Fail = (Status, Json<Value>);
-
-type FailR<T> = Result<T, Fail>;
 
 #[catch(default)]
 pub fn catch(status: Status, _: &Request) -> Fail {
     fail(status, "unknown")
 }
 
-fn fail(status: Status, reason: &str) -> Fail {
-    (status, Json(json! {{"reason": reason}}))
+fn fail<R: AsRef<str>>(status: Status, reason: R) -> Fail {
+    (status, Json(json! {{"reason": reason.as_ref()}}))
 }
 
 #[derive(Deserialize, Validate)]
@@ -40,22 +43,22 @@ pub struct CompletionReq<'a> {
     #[serde(borrow)]
     messages: Vec<Message<'a>>,
 
-    max_tokens: Option<u32>, // default input-cx; # of tokens to infer
+    max_tokens: Option<usize>, // default cx-input; # of tokens to infer
 
     #[validate(range(min = 1))]
-    n: Option<u32>, // default 1; # of completion choices
+    n: Option<usize>, // default 1; # of completion choices
 
+    // 0=greedy, 2=insane
     #[validate(range(min = 0., max = 2.))]
     temperature: Option<f32>, // default 1
 
+    // 0=greedy, 1=all
     #[validate(range(min = 0., max = 1.))]
-    top_p: Option<f32>, // default NONE
+    min_p: Option<f32>, // default NONE
 
-    #[validate(range(min = -2., max = 2.))]
-    frequency_penalty: Option<f32>, // default NONE
-
-    #[validate(range(min = -2., max = 2.))]
-    presence_penalty: Option<f32>, // default NONE
+    // 0=top-1, 1=top-k
+    #[validate(range(min = 0., max = 1.))]
+    min_s: Option<f32>, // default NONE
 
     // NOTE(valid): vals must be (-100, 100)
     logit_bias: Option<HashMap<Token, f32>>,
@@ -64,7 +67,7 @@ pub struct CompletionReq<'a> {
     logprobs: bool,
 
     #[validate(range(min = 0, max = 20))]
-    top_logprobs: Option<u32>, // default NONE; requires logprobs
+    top_logprobs: Option<usize>, // default NONE; requires logprobs
 
     #[serde(default)]
     response_format: Format,
@@ -75,40 +78,57 @@ pub struct CompletionReq<'a> {
 
     tool_choice: Option<ToolChoice<'a>>, // default "auto"
 
+    // TODO: stream_options for include usage on streams
     stream: Option<bool>, // default false
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "role")]
-#[rustfmt::skip]
 enum Message<'a> {
     #[serde(rename = "system")]
-    System { content: &'a str, name: Option<&'a str> },
+    System {
+        content: Cow<'a, str>,
+        name: Option<Cow<'a, str>>,
+    },
 
     #[serde(rename = "user")]
-    User { content: &'a str, name: Option<&'a str> },
+    User {
+        content: Cow<'a, str>,
+        name: Option<Cow<'a, str>>,
+    },
 
     #[serde(rename = "assistant")]
-    Assistant { content: &'a str, name: Option<&'a str>, tool_calls: Option<Call<'a>> },
+    Assistant {
+        content: Cow<'a, str>,
+        name: Option<Cow<'a, str>>,
+        tool_calls: Option<Vec<Call<'a>>>,
+    },
 
     #[serde(rename = "tool")]
-    Tool { content: &'a str, tool_call_id: &'a str },
+    Tool {
+        content: Cow<'a, str>,
+        tool_call_id: Cow<'a, str>,
+    },
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum Call<'a> {
     #[serde(rename = "function")]
-    Function { id: &'a str, function: Function<'a> },
+    Function {
+        id: Cow<'a, str>,
+        function: Function<'a>,
+        index: Option<usize>,
+    },
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Function<'a> {
-    name: &'a str,
-    arguments: &'a str,
+    name: Cow<'a, str>,
+    arguments: Cow<'a, str>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 #[serde(tag = "type")]
 enum Format {
     #[default]
@@ -119,15 +139,15 @@ enum Format {
     JsonObject,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum Stop<'a> {
-    String(&'a str),
+    One(&'a str),
 
-    On(Vec<&'a str>),
+    Many(Vec<&'a str>),
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum Tool<'a> {
     Function {
@@ -137,7 +157,7 @@ enum Tool<'a> {
     },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 enum ToolChoice<'a> {
     #[serde(rename = "function")]
@@ -147,95 +167,270 @@ enum ToolChoice<'a> {
     Tool(&'a str), // "none" | "auto" | "required"
 }
 
-type Completion = Result<Either<Json<Value>, EventStream<Receiver<Event>>>, Fail>;
+#[derive(Serialize)]
+#[serde(tag = "object")]
+enum Completion {
+    #[serde(rename = "chat.completion")]
+    Completion {
+        id: String,
+        choices: Vec<CompletionChoice>,
+        created: u64,
+        model: String,
+        system_fingerprint: String,
+        usage: Usage,
+    },
 
-#[post("/v1/chat/completions", format = "json", data = "<body>")]
-pub async fn completions(api: &State<Api>, body: Json<CompletionReq<'_>>) -> Completion {
-    let body = body.into_inner();
+    #[serde(rename = "chat.completion.chunk")]
+    Chunk {
+        id: String,
+        choices: Vec<ChunkChoice>,
+        created: u64,
+        model: String,
+        system_fingerprint: String,
+        usage: Option<Usage>, // only if last && stream include usage is set
+    },
+}
 
-    body.validate()
+#[derive(Serialize)]
+struct CompletionChoice {
+    finish_reason: &'static str, // "stop" | "length" | "content_filter" | "tool_calls"
+    index: usize,
+    message: RespMessage,
+    logprobs: Option<LogProbs>,
+}
+
+#[derive(Serialize)]
+struct ChunkChoice {
+    finish_reason: Option<&'static str>, // "stop" | "length" | "content_filter" | "tool_calls"
+    index: usize,
+    delta: RespMessage,
+    logprobs: Option<LogProbs>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "role")]
+enum RespMessage {
+    #[serde(rename = "assistant")]
+    Assistant {
+        content: Option<String>,
+        tool_calls: Vec<Call<'static>>,
+    },
+}
+
+// TODO: finish
+#[derive(Serialize)]
+struct LogProbs {}
+
+#[derive(Serialize)]
+struct Usage {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
+    cache_tokens: usize,
+}
+
+type ChatCompletion = Result<Either<Json<Completion>, EventStream<mpsc::Receiver<Event>>>, Fail>;
+
+#[post("/v1/chat/completions", format = "json", data = "<req>")]
+async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> ChatCompletion {
+    let req = req.into_inner();
+
+    req.validate()
         .map_err(|e| Json(serde_json::to_value(e).unwrap()))
         .map_err(|e| (Status::BadRequest, e))?;
 
     let api = api.inner();
-    let mut tokens = vec![];
+    let mut span = vec![api.tk.token_bos()];
 
-    for msg in body.messages {
-        // TODO(templates): pull jinjas
+    let v = Vocab::MistralV3;
+
+    for msg in req.messages.iter() {
         match msg {
-            // hmmmdge... not super great on mistral variants
-            Message::System { content, name } => {}
+            // NOTE: must be first
+            Message::System { content, name } => {
+                api.feed(&mut span, v.system(), content);
+            }
 
-            // should be supported by p much everything?
-            Message::User { content, name } => {}
+            // NOTE: must be followed by assistant
+            Message::User { content, name } => {
+                api.feed(&mut span, v.user(), content);
+            }
 
-            // this has tool_calls because it might trigger a tc
-            Message::Assistant { content, name, tool_calls } => {}
+            // NOTE: always after user
+            Message::Assistant { content, name, tool_calls } => match tool_calls {
+                // TODO(tools): implement
+                Some(calls) => unimplemented!(),
+                None => api.feed(&mut span, v.assistant(), content),
+            },
 
-            // this is how you give it the result of said tool call
-            Message::Tool { content, tool_call_id } => {}
+            // TODO(tools): we must create the json object
+            Message::Tool { content, tool_call_id } => {
+                api.feed(&mut span, v.tool_out(), content);
+            }
         }
-
-        // let msg = format!("{}: {}\n", msg.role, msg.content);
-        // api.tk.tokenize(&mut tokens, &msg, false, false);
     }
 
-    if tokens.len() >= api.max_n {
-        return Err(fail(Status::InsufficientStorage, "too many tokens :("));
+    // TODO(tools): we should not be adding this header, as we may want tool calls
+    api.prep(&mut span, v.assistant());
+
+    let n_max = min(api.n_train, api.n_cells);
+
+    if span.len() > n_max {
+        let msg = format!("too many infill tokens: {} > {n_max}", span.len());
+        return Err(fail(Status::InsufficientStorage, msg));
     }
 
-    let chain = Chain::sample();
+    let (tx, rx) = make_response_channel(req.stream.unwrap_or(false), 32);
 
-    if body.stream.unwrap_or(false) {
-        let (params, recv) = Params::streaming(chain);
-        api.schedule(tokens, params).await?;
+    // token limits
+    let k = api.n_cells - span.len();
+    let n = req.n.unwrap_or(1);
+    let q = min(k / n, api.n_train - span.len());
+    let n_infer = min(req.max_tokens.unwrap_or(q), q);
 
-        Ok(Either::Right(EventStream::from(recv)))
+    let p = Inflight {
+        temp: req.temperature.unwrap_or(1.),
+        min_p: req.min_p.unwrap_or(0.),
+        min_s: req.min_s.unwrap_or(0.),
+        n_infill: span.len(),
+        n_infer,
+        n_actual: 0,
+        span: vec![span; n],
+        text: vec![vec![]; n],
+        finish: vec![(n_infer == 0).then_some("length"); n],
+        tx,
+    };
+
+    api.schedule(p).await?;
+
+    Ok(match rx {
+        Either::Left(recv) => Either::Left(
+            recv.await
+                .map_err(|_| fail(Status::InternalServerError, "unknown"))?,
+        ),
+
+        Either::Right(recv) => Either::Right(EventStream::from(recv)),
+    })
+}
+
+#[allow(clippy::type_complexity)]
+fn make_response_channel(
+    stream: bool,
+    buffer: usize,
+) -> (
+    Either<Option<ones::Sender<Json<Completion>>>, mpsc::Sender<Event>>,
+    Either<ones::Receiver<Json<Completion>>, mpsc::Receiver<Event>>,
+) {
+    if stream {
+        let (tx, rx) = mpsc::channel(buffer);
+        (Either::Right(tx), Either::Right(rx))
     } else {
-        let (params, recv) = Params::unary(chain);
-        api.schedule(tokens, params).await?;
-
-        let body = recv
-            .await
-            .map_err(|_| fail(Status::InternalServerError, "unknown"))?;
-
-        Ok(Either::Left(body))
+        let (tx, rx) = ones::channel();
+        (Either::Left(Some(tx)), Either::Left(rx))
     }
 }
 
-// TODO: time 2 restructure
-struct Params {
-    tx: Either<oneshot::Sender<Json<Value>>, Sender<Event>>,
-    chain: Chain<Sample>,
+// TODO(shift): support priveleged 'sliding window' type spans
+
+// TODO(beam-search): modifications needed aren't huge:
+// - decoding logic is unchanged
+// - we already store space for beams (choices)
+// can then further search for CoTs ala https://arxiv.org/pdf/2402.10200
+
+struct Inflight {
+    temp: f32,  // softmax temperature
+    min_p: f32, // ratio of max probability to consider min
+    min_s: f32, // min ratio of probability steps
+
+    n_infill: usize,       // how much of span is infill?
+    n_infer: usize,        // max tokens to infer
+    n_actual: usize,       // # tokens actually decoded (noncached)
+    span: Vec<Vec<Token>>, // span tokens
+    text: Vec<Vec<u8>>,    // detokenized
+
+    finish: Vec<Option<&'static str>>, // finish reason of each choice
+    tx: Either<Option<ones::Sender<Json<Completion>>>, mpsc::Sender<Event>>,
 }
 
-impl Params {
-    fn unary(chain: Chain<Sample>) -> (Self, oneshot::Receiver<Json<Value>>) {
-        let (tx, rx) = oneshot::channel();
-        let tx = Either::Left(tx);
-        let p = Self { tx, chain };
-
-        (p, rx)
+impl Inflight {
+    fn has_enabled(&self) -> bool {
+        self.finish.iter().any(|f| f.is_none())
     }
 
-    fn streaming(chain: Chain<Sample>) -> (Self, Receiver<Event>) {
-        let (tx, rx) = mpsc::channel(32);
-        let tx = Either::Right(tx);
-        let p = Self { tx, chain };
-
-        (p, rx)
+    fn enabled(&self) -> impl Iterator<Item = &[Token]> {
+        iter::zip(&self.span, &self.finish)
+            .filter(|(_, e)| e.is_none())
+            .map(|(s, _)| s.as_slice())
     }
 
-    fn sample(&mut self, ctx: &mut Context, logits: &mut Logits) -> Option<Token> {
-        let token = self.chain.choose(ctx, logits);
+    fn accept_logits(&mut self, ctx: &mut Context, logits: Output<Logit>, i: usize) {
+        assert!(self.finish[i].is_none(), "accept on disabled span?");
 
-        // TODO: actually send a response back or w/e
+        let tok = logits
+            .softmax(self.temp)
+            .trunc_k(self.min_p, self.min_s, 1)
+            .distribution()
+            .sample();
 
-        if ctx.model().token_is_eog(token) {
-            return None;
+        self.span[i].push(tok);
+        ctx.detokenize(&mut self.text[i], tok, false);
+
+        // TODO: stop strings, fsm stuff, etc etc
+
+        // check stop conds
+        if ctx.model().token_is_eog(tok) {
+            self.finish[i] = Some("stop");
+        } else if self.span[i].len() - self.n_infill >= self.n_infer {
+            self.finish[i] = Some("length");
         }
 
-        Some(token)
+        let done = !self.has_enabled();
+
+        match &mut self.tx {
+            Either::Left(tx) if done => {
+                // TODO: tools & logprobs
+                let choices = iter::zip(&self.finish, &self.text)
+                    .enumerate()
+                    .map(|(i, (stop, text))| CompletionChoice {
+                        finish_reason: stop.unwrap(),
+                        index: i,
+                        message: RespMessage::Assistant {
+                            content: Some(String::from_utf8_lossy(text).into_owned()),
+                            tool_calls: vec![],
+                        },
+                        logprobs: None,
+                    })
+                    .collect();
+
+                // TODO: id, timestamp, model, fingerprint, usage
+                let mut usage = Usage {
+                    prompt_tokens: self.n_infill,
+                    completion_tokens: self.span.iter().map(|s| s.len() - self.n_infill).sum(),
+                    total_tokens: 0,
+                    cache_tokens: 0,
+                };
+
+                usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+                usage.cache_tokens = usage.total_tokens - self.n_actual;
+
+                let completion = Completion::Completion {
+                    id: "id".to_owned(),
+                    choices,
+                    created: 0,
+                    model: "model".to_owned(),
+                    system_fingerprint: "fingerprint".to_owned(),
+                    usage,
+                };
+
+                let _ = tx.take().unwrap().send(Json(completion));
+            }
+
+            Either::Right(tx) => {
+                //let _ = tx.try_send(Event::json(&Completion::Chunk {}));
+            }
+
+            _ => {}
+        }
     }
 }
 
@@ -248,14 +443,15 @@ pub enum Error {
     LoadContext,
 
     #[error("decode error: {0:?}")]
-    Decode(#[from] llama_sys::DecodeError),
+    Decode(#[from] llama_sys::Error),
 }
 
 pub struct Api {
-    queue: Sender<(Vec<Token>, Params)>,
+    queue: mpsc::Sender<Inflight>,
     inner: Arc<Mutex<Inner>>,
     tk: Tokenizer,
-    max_n: usize,
+    n_train: usize,
+    n_cells: usize,
 }
 
 impl Api {
@@ -266,8 +462,8 @@ impl Api {
 
         let (queue, rx) = mpsc::channel(32);
 
-        let max_n = min(model.n_ctx_train(), ctx.kv_cache_n_cells());
-
+        let n_train = model.n_ctx_train();
+        let n_cells = ctx.kv_cache_n_cells();
         let root = ctx.kv_cache_unique_id();
 
         let inner = Arc::new(Mutex::new(Inner {
@@ -278,97 +474,158 @@ impl Api {
             cache: RadixKv::new(root),
         }));
 
-        Ok(Self { queue, inner, tk, max_n })
+        Ok(Self {
+            queue,
+            inner,
+            tk,
+            n_train,
+            n_cells,
+        })
     }
 
-    async fn schedule(&self, tokens: Vec<Token>, params: Params) -> Result<JoinHandle<()>, Fail> {
+    /// Feed a closed header into buf.
+    fn feed(&self, buf: &mut Vec<Token>, h: [&str; 2], text: &str) {
+        self.tk.tokenize(buf, h[0], true);
+        self.tk.tokenize(buf, text, false);
+        self.tk.tokenize(buf, h[1], true);
+    }
+
+    /// Feed an open header into buf.
+    fn prep(&self, buf: &mut Vec<Token>, h: [&str; 2]) {
+        self.tk.tokenize(buf, h[0], true);
+    }
+
+    /// Schedule an inflight completion req.
+    async fn schedule(&self, params: Inflight) -> Result<JoinHandle<()>, Fail> {
         let mut jobs = self.queue.clone();
 
-        jobs.send((tokens, params))
+        jobs.send(params)
             .await
             .map_err(|_| fail(Status::InternalServerError, "failed to schedule span"))?;
 
         let inner = self.inner.clone();
-        Ok(spawn_blocking(move || Inner::flush_all(inner)))
+
+        Ok(spawn_blocking(move || Inner::flush_all(inner).unwrap()))
     }
 }
 
 struct Inner {
     ctx: Context,
     n_batch: usize,
-    queue: Receiver<(Vec<Token>, Params)>,
-    sched: Vec<(Vec<Token>, Params)>,
+    queue: mpsc::Receiver<Inflight>,
+    sched: Vec<Inflight>,
     cache: RadixKv,
 }
 
 impl Inner {
-    fn flush_all(mu: Arc<Mutex<Self>>) {
+    fn flush_all(mu: Arc<Mutex<Self>>) -> Result<(), Error> {
         while !{
             let mut ex = mu.lock().unwrap();
-            ex.flush().unwrap();
+            ex.flush_bounded()?;
             ex.sched.is_empty()
         } {}
+
+        Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), Error> {
-        while let Ok(Some(span)) = self.queue.try_next() {
-            self.sched.push(span);
+    fn flush_bounded(&mut self) -> Result<(), Error> {
+        // move any new requests to the back of scheduled queue
+        while let Ok(Some(p)) = self.queue.try_next() {
+            self.sched.push(p);
         }
 
-        // decode a batch of pending tokens
-        let bounds: Vec<_> = (self.sched.iter())
-            .map(|(s, _)| s.len() - self.cache.ancestor(s).1)
+        // compute how much kv space may be allocated to each scheduled span
+        let mut plan = Radix::new();
+        let mut left = self.ctx.kv_cache_n_cells();
+        let mut k = 0; // # of params that fit
+
+        'outer: for p in self.sched.iter() {
+            for span in p.enabled() {
+                let a = plan.ancestor(span);
+                let n = span.len() - a.n;
+
+                if n > left {
+                    break 'outer;
+                }
+
+                left -= n;
+                plan.insert(a, span);
+            }
+
+            k += 1;
+        }
+
+        let sched = &mut self.sched[..k];
+
+        // at this point, we know all spans in sched will pack into available kv
+        let bounds: Vec<_> = sched
+            .iter()
+            .flat_map(|p| p.enabled())
+            .map(|span| span.len() - self.cache.ancestor(span).n)
             .collect();
 
-        // TODO: we should distribute total cache size amongst all requests
-        let budget = clamp_sum(self.n_batch, &bounds, |&n| n);
+        let mut actual = Vec::with_capacity(sched.len());
 
-        for (i, q_alloc) in budget.into_iter().enumerate() {
-            if q_alloc == 0 {
+        // distribute (inexact in the case of shared prefixes)
+        for (m, (i, span)) in iter::zip(
+            clamp_sum(self.n_batch, &bounds, |&n| n),
+            sched
+                .iter()
+                .enumerate()
+                .flat_map(|(i, p)| p.enabled().map(move |s| (i, s))),
+        ) {
+            if m == 0 {
                 continue;
             }
 
-            let tokens = &self.sched[i].0;
-            let (_, n_cached, _) = self.cache.ancestor(tokens);
-            let len = (n_cached + q_alloc).min(tokens.len());
+            let a = self.cache.ancestor(span);
+            let n = min(span.len(), a.n + m);
+            let k = n - a.n;
+            actual.push((i, k));
 
-            println!(
-                "{i}: n_cached={n_cached}, q_alloc={q_alloc}, len={}, taking={}",
-                tokens.len(),
-                len - n_cached,
-            );
-
-            self.cache.insert_cold(&mut self.ctx, &tokens[..len]);
+            self.cache.insert(&mut self.ctx, a, &span[..n]);
         }
 
+        // TODO: figure out a way to fuse into above loop
+        for (i, k) in actual {
+            sched[i].n_actual += k;
+        }
+
+        // prune (skipping all running) to ensure upcoming batch doesn't overflow kv size
+        let it = sched.iter().flat_map(|p| p.enabled());
+        self.cache.prune(&mut self.ctx, it);
+
+        // decode w/e spans are marked as cold
         let batch = self.cache.pending_batch();
-        let evals = self.ctx.decode_tokens(&batch)?;
+        let evals = self.ctx.decode(&batch)?;
 
-        let logits: Vec<_> = evals.into_iter().filter_map(|e| e.logits).collect();
-        let act = vec![vec![]; logits.len()];
+        self.cache
+            .accept_batch(evals.into_iter().map(|o| o.unwrap()));
 
-        self.cache.accept_batch(iter::zip(logits, act));
-        self.cache.compact();
-
-        // sample on any spans
+        // dispatch logits to any running spans that are fully infilled
         let mut gc = vec![];
 
-        for (i, (span, params)) in self.sched.iter_mut().enumerate() {
-            let (j, n_cached, _) = self.cache.ancestor(span);
+        for (i, p) in sched.iter_mut().enumerate() {
+            for j in 0..p.span.len() {
+                if p.finish[j].is_some() {
+                    continue;
+                }
 
-            if n_cached < span.len() {
-                continue;
+                let span = &p.span[j];
+                let a = self.cache.ancestor(span);
+
+                if a.n < span.len() {
+                    continue;
+                }
+
+                assert_eq!(a.n, span.len());
+                assert_eq!(self.cache[a.i].tokens.len(), self.cache[a.i].logits.len(),);
+
+                let logits = self.cache[a.i].logits[a.k - 1].clone();
+                p.accept_logits(&mut self.ctx, logits, j);
             }
 
-            // TODO: if no logits, do the thing
-            let logits = match &mut self.cache[j].state {
-                Kv::Hot(logits, _) => logits,
-                s => panic!("{s:?}"),
-            };
-
-            if let Some(token) = params.sample(&mut self.ctx, logits) {
-                span.push(token);
-            } else {
+            if !p.has_enabled() {
                 gc.push(i);
             }
         }

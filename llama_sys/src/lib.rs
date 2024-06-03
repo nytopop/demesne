@@ -1,5 +1,4 @@
 use std::ffi::{c_void, CString};
-use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::ptr::{self, copy_nonoverlapping};
 use std::slice;
@@ -21,7 +20,7 @@ pub mod control;
 pub mod sampling;
 
 use control::{ControlVector, TensorProbe};
-use sampling::{Grammar, Logits};
+use sampling::{Logit, Output};
 
 /// As the name implies, disable logging.
 ///
@@ -31,79 +30,6 @@ pub unsafe fn disable_logging() {
     extern "C" fn noop(_level: sys::ggml_log_level, _text: *const i8, _user_data: *mut c_void) {}
 
     sys::llama_log_set(Some(noop), ptr::null_mut());
-}
-
-pub trait ToTokens: Send + 'static {
-    fn to_tokens(&self, ctx: &mut Context) -> Vec<Token>;
-}
-
-impl ToTokens for String {
-    fn to_tokens(&self, ctx: &mut Context) -> Vec<Token> {
-        let mut tokens = vec![];
-        ctx.tokenize(tokens.as_mut(), self, false, false);
-        tokens
-    }
-}
-
-impl ToTokens for &'static str {
-    fn to_tokens(&self, ctx: &mut Context) -> Vec<Token> {
-        let mut tokens = vec![];
-        ctx.tokenize(tokens.as_mut(), self, false, false);
-        tokens
-    }
-}
-
-impl ToTokens for Vec<Token> {
-    fn to_tokens(&self, _: &mut Context) -> Vec<Token> {
-        self.clone()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Bos;
-
-impl ToTokens for Bos {
-    fn to_tokens(&self, ctx: &mut Context) -> Vec<Token> {
-        vec![ctx.model().token_bos()]
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Tokenize {
-    /// Add a BOS token.
-    pub bos: bool,
-
-    /// Parse special tokens in the input.
-    pub special: bool,
-
-    /// The text to tokenize.
-    pub input: String,
-}
-
-impl Tokenize {
-    pub fn with_special<S: Into<String>>(input: S) -> Self {
-        Self {
-            bos: false,
-            special: true,
-            input: input.into(),
-        }
-    }
-
-    pub fn bare<S: Into<String>>(input: S) -> Self {
-        Self {
-            bos: false,
-            special: false,
-            input: input.into(),
-        }
-    }
-}
-
-impl ToTokens for Tokenize {
-    fn to_tokens(&self, ctx: &mut Context) -> Vec<Token> {
-        let mut tokens = vec![];
-        ctx.tokenize(tokens.as_mut(), &self.input, self.bos, self.special);
-        tokens
-    }
 }
 
 unsafe impl Sync for ContextParams {}
@@ -360,6 +286,7 @@ impl ModelParams {
     }
 }
 
+#[derive(Clone)]
 pub struct Tokenizer(Arc<Model>);
 
 unsafe impl Sync for Tokenizer {}
@@ -379,8 +306,8 @@ impl Tokenizer {
     /// all tokens.
     ///
     /// Returns the number of encoded tokens.
-    pub fn tokenize(&self, buf: &mut Vec<Token>, text: &str, bos: bool, special: bool) -> usize {
-        self.0.tokenize(buf, text, bos, special)
+    pub fn tokenize(&self, buf: &mut Vec<Token>, text: &str, special: bool) -> usize {
+        self.0.tokenize(buf, text, special)
     }
 
     /// Returns the vocabulary type.
@@ -470,6 +397,7 @@ impl Model {
         Some(Arc::new(Self(raw)))
     }
 
+    /// Get a tokenizer that is safe to use in multiple threads.
     pub fn tokenizer(self: &Arc<Self>) -> Tokenizer {
         Tokenizer(self.clone())
     }
@@ -529,7 +457,7 @@ impl Model {
     /// all tokens.
     ///
     /// Returns the number of encoded tokens.
-    pub fn tokenize(&self, buf: &mut Vec<Token>, text: &str, bos: bool, special: bool) -> usize {
+    pub fn tokenize(&self, buf: &mut Vec<Token>, text: &str, special: bool) -> usize {
         unsafe {
             loop {
                 let len = buf.len();
@@ -544,7 +472,7 @@ impl Model {
                     text.len() as i32,
                     ptr,
                     cap,
-                    bos,
+                    false,
                     special,
                 );
 
@@ -637,6 +565,11 @@ impl Model {
     /// Returns true if `token` is meant to halt generation (EOS, EOT, etc)
     pub fn token_is_eog(&self, token: Token) -> bool {
         unsafe { sys::llama_token_is_eog(self.0, token) }
+    }
+
+    /// Returns true if `token` is a control token.
+    pub fn token_is_control(&self, token: Token) -> bool {
+        unsafe { sys::llama_token_is_control(self.0, token) }
     }
 
     /// Returns the beginning of string token.
@@ -787,16 +720,14 @@ impl Context {
     /// Remove a range of tokens from a sequence.
     ///
     /// If `seq_id` is < 0, matches all sequences.
-    pub fn kv_cache_seq_rm(&mut self, seq_id: SeqId, range: impl RangeBounds<Pos>) -> bool {
-        let (s, e) = llama_bounds(range);
-        unsafe { sys::llama_kv_cache_seq_rm(self.ctx, seq_id, s, e) }
+    pub fn kv_cache_seq_rm(&mut self, seq_id: SeqId, p0: Pos, p1: Pos) -> bool {
+        unsafe { sys::llama_kv_cache_seq_rm(self.ctx, seq_id, p0, p1) }
     }
 
     /// Copy tokens in the provided range to another sequence. This doesn't allocate; kv cache entries
     /// can be referenced by multiple sequences.
-    pub fn kv_cache_seq_cp(&mut self, src: SeqId, dst: SeqId, range: impl RangeBounds<Pos>) {
-        let (s, e) = llama_bounds(range);
-        unsafe { sys::llama_kv_cache_seq_cp(self.ctx, src, dst, s, e) }
+    pub fn kv_cache_seq_cp(&mut self, src: SeqId, dst: SeqId, p0: Pos, p1: Pos) {
+        unsafe { sys::llama_kv_cache_seq_cp(self.ctx, src, dst, p0, p1) }
     }
 
     /// Remove any tokens that don't belong to the provided sequence.
@@ -805,15 +736,13 @@ impl Context {
     }
 
     /// Add relative position `delta` to a range of tokens in a sequence.
-    pub fn kv_cache_seq_add(&mut self, seq_id: SeqId, range: impl RangeBounds<Pos>, delta: Pos) {
-        let (s, e) = llama_bounds(range);
-        unsafe { sys::llama_kv_cache_seq_add(self.ctx, seq_id, s, e, delta) }
+    pub fn kv_cache_seq_add(&mut self, seq_id: SeqId, p0: Pos, p1: Pos, delta: Pos) {
+        unsafe { sys::llama_kv_cache_seq_add(self.ctx, seq_id, p0, p1, delta) }
     }
 
     /// Divide relative positions of a range of tokens by a constant factor.
-    pub fn kv_cache_seq_div(&mut self, seq_id: SeqId, range: impl RangeBounds<Pos>, by: Pos) {
-        let (s, e) = llama_bounds(range);
-        unsafe { sys::llama_kv_cache_seq_div(self.ctx, seq_id, s, e, by) }
+    pub fn kv_cache_seq_div(&mut self, seq_id: SeqId, p0: Pos, p1: Pos, by: Pos) {
+        unsafe { sys::llama_kv_cache_seq_div(self.ctx, seq_id, p0, p1, by) }
     }
 
     /// Returns the largest position present for the provided sequence.
@@ -832,39 +761,19 @@ impl Context {
     }
 }
 
-// Convert rust-style range bounds to llama-style range bounds.
-//
-// start < 0 : [0,  c1]
-// end   < 0 : [c0, inf]
-fn llama_bounds<R: RangeBounds<Pos>>(bounds: R) -> (Pos, Pos) {
-    let s = match bounds.start_bound() {
-        Bound::Included(x) => *x,
-        Bound::Excluded(x) => *x + 1,
-        Bound::Unbounded => -1,
-    };
-
-    let e = match bounds.end_bound() {
-        Bound::Included(x) => *x + 1,
-        Bound::Excluded(x) => *x,
-        Bound::Unbounded => -1,
-    };
-
-    (s, e)
-}
-
 // state
 impl Context {
     pub fn state_data_get(&mut self, dst: &mut [u8]) -> usize {
         unsafe {
             assert!(dst.len() >= sys::llama_get_state_size(self.ctx));
-            sys::llama_copy_state_data(self.ctx, dst.as_mut_ptr())
+            sys::llama_state_get_data(self.ctx, dst.as_mut_ptr())
         }
     }
 
     pub fn state_data_put(&mut self, src: &[u8]) -> usize {
         unsafe {
             assert!(src.len() >= sys::llama_get_state_size(self.ctx));
-            sys::llama_set_state_data(self.ctx, src.as_ptr())
+            sys::llama_state_set_data(self.ctx, src.as_ptr())
         }
     }
 
@@ -873,10 +782,26 @@ impl Context {
     }
 }
 
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(thiserror::Error, Clone, Copy, Debug)]
+pub enum Error {
+    #[error("invalid input embedding length")]
+    InputEmbedding,
+    #[error("batch is empty")]
+    Empty,
+    #[error("overflowed n_seq")]
+    TooManySeqs,
+    #[error("llama.cpp: couldn't find kv slot")]
+    Slot,
+    #[error("llama.cpp: unknown error code {0}")]
+    Code(i32),
+}
+
 // decoding
 impl Context {
-    pub fn decode_tokens(&mut self, batch: &[EvalReq<Token>]) -> DecodeResult<Vec<Eval>> {
-        let mut evals = Vec::new();
+    pub fn decode(&mut self, batch: &[EvalReq<Token>]) -> Result<Vec<Option<Output<Logit>>>> {
+        let mut evals = Vec::with_capacity(batch.len());
 
         for chunk in batch.chunks(self.n_batch() as usize) {
             unsafe {
@@ -887,7 +812,7 @@ impl Context {
                     let seq_ids = &req.seq_ids;
 
                     if req.seq_ids.len() > 32 {
-                        return Err(DecodeError::TooManySeqs);
+                        return Err(Error::TooManySeqs);
                     }
 
                     // SAFETY: bounds checked above
@@ -901,8 +826,8 @@ impl Context {
                 }
 
                 match sys::llama_decode(self.ctx, *batch) {
-                    e if e < 0 => return Err(DecodeError::Error),
-                    e if e > 0 => return Err(DecodeError::Slot),
+                    e if e < 0 => return Err(Error::Code(e)),
+                    e if e > 0 => return Err(Error::Slot),
                     _ => {}
                 }
 
@@ -913,11 +838,11 @@ impl Context {
         Ok(evals)
     }
 
-    pub fn decode_embeddings<Q>(&mut self, batch: &[EvalReq<Q>]) -> DecodeResult<Vec<Eval>>
+    pub fn decode_embed<Q>(&mut self, batch: &[EvalReq<Q>]) -> Result<Vec<Option<Output<Logit>>>>
     where
         Q: AsRef<[f32]>,
     {
-        let mut evals = Vec::new();
+        let mut evals = Vec::with_capacity(batch.len());
 
         for chunk in batch.chunks(self.n_batch() as usize) {
             unsafe {
@@ -930,7 +855,7 @@ impl Context {
                     let seq_ids = &req.seq_ids;
 
                     if seq_ids.len() > 32 {
-                        return Err(DecodeError::TooManySeqs);
+                        return Err(Error::TooManySeqs);
                     }
 
                     // SAFETY: bounds checked above
@@ -938,7 +863,7 @@ impl Context {
 
                     let input = req.input.as_ref();
                     if input.len() != n_embed {
-                        return Err(DecodeError::InputEmbedding);
+                        return Err(Error::InputEmbedding);
                     }
 
                     // SAFETY: bounds checked above
@@ -951,8 +876,8 @@ impl Context {
                 }
 
                 match sys::llama_decode(self.ctx, *batch) {
-                    e if e < 0 => return Err(DecodeError::Error),
-                    e if e > 0 => return Err(DecodeError::Slot),
+                    e if e < 0 => return Err(Error::Code(e)),
+                    e if e > 0 => return Err(Error::Slot),
                     _ => {}
                 }
 
@@ -963,25 +888,21 @@ impl Context {
         Ok(evals)
     }
 
-    unsafe fn evals<'a, Q>(&'a self, reqs: &'a [EvalReq<Q>]) -> impl Iterator<Item = Eval> + 'a {
-        reqs.iter().enumerate().map(move |(i, req)| Eval {
-            seq_ids: req.seq_ids.clone(),
-            pos: req.pos,
-            logits: req.logits.then(|| self.get_logits_ith(i)),
-        })
+    unsafe fn evals<'a, Q>(
+        &'a self,
+        reqs: &'a [EvalReq<Q>],
+    ) -> impl Iterator<Item = Option<Output<Logit>>> + 'a {
+        reqs.iter()
+            .enumerate()
+            .map(move |(i, req)| req.logits.then(|| self.get_logits_ith(i)))
     }
 
-    unsafe fn get_logits_ith(&self, i: usize) -> Logits {
+    unsafe fn get_logits_ith(&self, i: usize) -> Output<Logit> {
         let ptr = sys::llama_get_logits_ith(self.ctx, i as i32);
-        let n = self.model.n_vocab() as usize;
+        let voc = self.model.n_vocab() as usize;
+        let raw = slice::from_raw_parts(ptr, voc);
 
-        let token_data = slice::from_raw_parts(ptr, n)
-            .iter()
-            .enumerate()
-            .map(|(id, &logit)| sys::llama_token_data { id: id as Token, logit, p: 0. })
-            .collect();
-
-        Logits::from_vec(token_data)
+        Output::from_logits(raw, 96)
     }
 
     /// Set whether to use causal attention or not (default: ?).
@@ -996,22 +917,6 @@ impl Context {
     pub fn synchronize(&mut self) {
         unsafe { sys::llama_synchronize(self.ctx) }
     }
-}
-
-pub type DecodeResult<T> = Result<T, DecodeError>;
-
-#[derive(thiserror::Error, Clone, Copy, Debug)]
-pub enum DecodeError {
-    #[error("invalid input embedding length")]
-    InputEmbedding,
-    #[error("batch is empty")]
-    Empty,
-    #[error("overflowed n_seq")]
-    TooManySeqs,
-    #[error("llama.cpp: unknown")]
-    Error,
-    #[error("llama.cpp: couldn't find kv slot")]
-    Slot,
 }
 
 #[derive(Clone, Debug)]
@@ -1038,13 +943,6 @@ impl<Input> EvalReq<Input> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Eval {
-    pub seq_ids: Vec<SeqId>,
-    pub pos: Pos,
-    pub logits: Option<Logits>,
-}
-
 // tokenization
 impl Context {
     /// Detokenize `token` into the provided buffer, allocating if there isn't enough space to store
@@ -1059,17 +957,17 @@ impl Context {
     /// all tokens.
     ///
     /// Returns the number of encoded tokens.
-    pub fn tokenize(&self, buf: &mut Vec<Token>, text: &str, bos: bool, special: bool) -> usize {
-        self.model.tokenize(buf, text, bos, special)
+    pub fn tokenize(&self, buf: &mut Vec<Token>, text: &str, special: bool) -> usize {
+        self.model.tokenize(buf, text, special)
     }
 }
 
 // control vectors
 impl Context {
-    pub fn control_vector_apply(&mut self, v: Option<ControlVector<'_>>) -> Result<(), ErrorCode> {
+    pub fn control_vector_apply(&mut self, v: Option<ControlVector<'_>>) -> Result<()> {
         let to_res = |code| match code {
             0 => Ok(()),
-            e => Err(ErrorCode(e)),
+            e => Err(Error::Code(e)),
         };
 
         unsafe {
@@ -1102,119 +1000,8 @@ impl Context {
         unsafe { (*self.probe).disable() }
     }
 
+    // FIXME(perf): this is horrid, just alloc once and provide slices into the buffer
     pub fn drain_tensors(&mut self) -> impl Iterator<Item = Vec<f32>> + '_ {
         unsafe { (*self.probe).drain() }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ErrorCode(pub i32);
-
-// sampling
-impl Context {
-    /// Set the rng seed for this context.
-    pub fn set_rng_seed(&mut self, seed: u32) {
-        unsafe { sys::llama_set_rng_seed(self.ctx, seed) }
-    }
-
-    pub fn sample_token(&mut self, eval: &mut Logits) -> Token {
-        unsafe { sys::llama_sample_token(self.ctx, eval.as_mut()) }
-    }
-
-    pub fn sample_token_greedy(&mut self, eval: &mut Logits) -> Token {
-        unsafe { sys::llama_sample_token_greedy(self.ctx, eval.as_mut()) }
-    }
-
-    pub fn sample_token_mirostat_v2(
-        &mut self,
-        eval: &mut Logits,
-        tau: f32,
-        eta: f32,
-        mu: &mut f32,
-    ) -> Token {
-        unsafe { sys::llama_sample_token_mirostat_v2(self.ctx, eval.as_mut(), tau, eta, mu) }
-    }
-
-    pub fn sample_entropy(&mut self, eval: &mut Logits, min: f32, max: f32, exp: f32) {
-        unsafe { sys::llama_sample_entropy(self.ctx, eval.as_mut(), min, max, exp) }
-    }
-
-    pub fn sample_temp(&mut self, eval: &mut Logits, temp: f32) {
-        unsafe { sys::llama_sample_temp(self.ctx, eval.as_mut(), temp) }
-    }
-
-    pub fn sample_typical(&mut self, eval: &mut Logits, p: f32, min_keep: usize) {
-        unsafe { sys::llama_sample_typical(self.ctx, eval.as_mut(), p, min_keep) }
-    }
-
-    pub fn sample_tail_free(&mut self, eval: &mut Logits, z: f32, min_keep: usize) {
-        unsafe { sys::llama_sample_tail_free(self.ctx, eval.as_mut(), z, min_keep) }
-    }
-
-    pub fn sample_top_k(&mut self, eval: &mut Logits, k: usize, min_keep: usize) {
-        unsafe { sys::llama_sample_top_k(self.ctx, eval.as_mut(), k as i32, min_keep) }
-    }
-
-    pub fn sample_top_p(&mut self, eval: &mut Logits, p: f32, min_keep: usize) {
-        unsafe { sys::llama_sample_top_p(self.ctx, eval.as_mut(), p, min_keep) }
-    }
-
-    pub fn sample_min_p(&mut self, eval: &mut Logits, p: f32, min_keep: usize) {
-        unsafe { sys::llama_sample_min_p(self.ctx, eval.as_mut(), p, min_keep) }
-    }
-
-    pub fn sample_softmax(&mut self, eval: &mut Logits) {
-        unsafe { sys::llama_sample_softmax(self.ctx, eval.as_mut()) }
-    }
-
-    pub fn sample_cfg(&mut self, logits: &mut [f32], guidance: &mut [f32], scale: f32) {
-        unsafe {
-            sys::llama_sample_apply_guidance(
-                self.ctx,
-                logits.as_mut_ptr(),
-                guidance.as_mut_ptr(),
-                scale,
-            )
-        }
-    }
-
-    pub fn sample_repetition_penalties(
-        &mut self,
-        eval: &mut Logits,
-        last_tokens: &[Token],
-        repeat: f32,
-        freq: f32,
-        present: f32,
-    ) {
-        unsafe {
-            sys::llama_sample_repetition_penalties(
-                self.ctx,
-                eval.as_mut(),
-                last_tokens.as_ptr(),
-                last_tokens.len(),
-                repeat,
-                freq,
-                present,
-            )
-        }
-    }
-
-    pub fn sample_grammar(&mut self, eval: &mut Logits, grammar: &Grammar) {
-        unsafe { sys::llama_sample_grammar(self.ctx, eval.as_mut(), grammar.0) }
-    }
-
-    pub fn accept_grammar(&mut self, grammar: &mut Grammar, token: Token) {
-        unsafe { sys::llama_grammar_accept_token(self.ctx, grammar.0, token) }
-    }
-}
-
-// performance information
-impl Context {
-    pub fn get_timings(&mut self) -> sys::llama_timings {
-        unsafe { sys::llama_get_timings(self.ctx) }
-    }
-
-    pub fn reset_timings(&mut self) {
-        unsafe { sys::llama_reset_timings(self.ctx) }
     }
 }
