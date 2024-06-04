@@ -21,6 +21,8 @@ fn main() {
     // TODO: avx512_*** and the cpu HBM stuff
     conf.define("LLAMA_FMA", on(cfg!(target_feature = "fma")));
 
+    println!("cargo:rustc-link-lib=dylib=gomp");
+
     // rocm (amdgpu)
     #[cfg(feature = "rocm")]
     {

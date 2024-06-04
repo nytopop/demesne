@@ -4,7 +4,7 @@ from rocm/dev-ubuntu-22.04:6.0-complete as build
 # install rust + random deps
 run apt update \
  && apt upgrade -y \
- && apt install -y pkg-config libssl-dev cmake libclang-dev protobuf-compiler libprotobuf-dev
+ && apt install -y pkg-config libssl-dev cmake libclang-dev protobuf-compiler libprotobuf-dev libomp-dev
 
 run curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly -y
 

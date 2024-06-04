@@ -325,8 +325,8 @@ impl Tokenizer {
         self.0.n_vocab()
     }
 
-    pub fn token_type(&self, token: Token) -> sys::llama_token_type {
-        self.0.token_type(token)
+    pub fn token_attr(&self, token: Token) -> sys::llama_token_attr {
+        self.0.token_attr(token)
     }
 
     /// Returns the beginning of string token.
@@ -558,8 +558,8 @@ impl Model {
         unsafe { sys::llama_model_size(self.0) }
     }
 
-    pub fn token_type(&self, token: Token) -> sys::llama_token_type {
-        unsafe { sys::llama_token_get_type(self.0, token) }
+    pub fn token_attr(&self, token: Token) -> sys::llama_token_attr {
+        unsafe { sys::llama_token_get_attr(self.0, token) }
     }
 
     /// Returns true if `token` is meant to halt generation (EOS, EOT, etc)
