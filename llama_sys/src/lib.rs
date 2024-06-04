@@ -902,7 +902,7 @@ impl Context {
         let voc = self.model.n_vocab() as usize;
         let raw = slice::from_raw_parts(ptr, voc);
 
-        Output::from_logits(raw, 96)
+        Output::from_logits(raw, 128)
     }
 
     /// Set whether to use causal attention or not (default: ?).
