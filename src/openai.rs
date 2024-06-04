@@ -242,7 +242,7 @@ async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> Cha
     let api = api.inner();
     let mut span = vec![api.tk.token_bos()];
 
-    let v = Vocab::MistralV3;
+    let v = Vocab::Llama3;
 
     for msg in req.messages.iter() {
         match msg {
@@ -259,7 +259,7 @@ async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> Cha
             // NOTE: always after user
             Message::Assistant { content, name, tool_calls } => match tool_calls {
                 // TODO(tools): implement
-                Some(calls) => unimplemented!(),
+                Some(calls) => unimplemented!("soon.jpg"),
                 None => api.feed(&mut span, v.assistant(), content),
             },
 
@@ -280,7 +280,13 @@ async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> Cha
         return Err(fail(Status::InsufficientStorage, msg));
     }
 
-    let (tx, rx) = make_response_channel(req.stream.unwrap_or(false), 32);
+    let (tx, rx) = if req.stream.unwrap_or(false) {
+        let (tx, rx) = mpsc::channel(32);
+        (Either::Right(tx), Either::Right(rx))
+    } else {
+        let (tx, rx) = ones::channel();
+        (Either::Left(Some(tx)), Either::Left(rx))
+    };
 
     // token limits
     let k = api.n_cells - span.len();
@@ -311,23 +317,6 @@ async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> Cha
 
         Either::Right(recv) => Either::Right(EventStream::from(recv)),
     })
-}
-
-#[allow(clippy::type_complexity)]
-fn make_response_channel(
-    stream: bool,
-    buffer: usize,
-) -> (
-    Either<Option<ones::Sender<Json<Completion>>>, mpsc::Sender<Event>>,
-    Either<ones::Receiver<Json<Completion>>, mpsc::Receiver<Event>>,
-) {
-    if stream {
-        let (tx, rx) = mpsc::channel(buffer);
-        (Either::Right(tx), Either::Right(rx))
-    } else {
-        let (tx, rx) = ones::channel();
-        (Either::Left(Some(tx)), Either::Left(rx))
-    }
 }
 
 // TODO(shift): support priveleged 'sliding window' type spans
@@ -580,13 +569,11 @@ impl Inner {
 
             let a = self.cache.ancestor(span);
             let n = min(span.len(), a.n + m);
-            let k = n - a.n;
-            actual.push((i, k));
+            actual.push((i, n - a.n));
 
             self.cache.insert(&mut self.ctx, a, &span[..n]);
         }
 
-        // TODO: figure out a way to fuse into above loop
         for (i, k) in actual {
             sched[i].n_actual += k;
         }
