@@ -278,6 +278,7 @@ dependencies = [
  "futures",
  "llama_sys",
  "num_cpus",
+ "once_cell",
  "petgraph",
  "rocket",
  "serde",

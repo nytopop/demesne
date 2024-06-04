@@ -103,7 +103,6 @@ async fn main() -> Result<(), rocket::Error> {
 
     rocket::custom(config)
         .manage(openai::Api::load(o.model_path, m, c).unwrap())
-        .register("/", catchers![openai::catch])
         .mount("/", openai::routes())
         .launch()
         .await?;

@@ -1,4 +1,5 @@
 use std::cmp::{min, Ordering::*};
+use std::iter;
 use std::mem::replace;
 
 use rand::{thread_rng, Rng};
@@ -40,31 +41,57 @@ impl Output<Logit> {
         assert!(top_k <= xs.len());
 
         let mut o = Output {
-            data: vec![0.; top_k],
+            data: vec![f32::NEG_INFINITY; top_k],
             toks: vec![-1; top_k],
             mark: Logit,
         };
 
-        for (id, x) in xs.iter().enumerate() {
-            if *x <= o.data[top_k - 1] {
+        for (id, &logit) in xs.iter().enumerate() {
+            if logit <= o.data[top_k - 1] {
                 continue;
             }
 
-            let i = o
-                .data
-                .binary_search_by(|v| x.partial_cmp(v).unwrap())
-                .unwrap_or_else(|i| i);
-
-            if i < top_k - 1 {
-                o.data.copy_within(i..top_k - 1, i + 1);
-                o.toks.copy_within(i..top_k - 1, i + 1);
-            }
-
-            o.data[i] = *x;
-            o.toks[i] = id as Token;
+            o.insert(id as Token, logit);
         }
 
         o
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, id: Token, logit: f32) {
+        let i = self
+            .data
+            .binary_search_by(|v| logit.partial_cmp(v).unwrap())
+            .unwrap_or_else(|i| i);
+
+        let top_k = self.data.len();
+
+        if i < top_k - 1 {
+            self.data.copy_within(i..top_k - 1, i + 1);
+            self.toks.copy_within(i..top_k - 1, i + 1);
+        }
+
+        self.data[i] = logit;
+        self.toks[i] = id;
+    }
+
+    /// Apply the provided per-token logit bias.
+    pub fn apply_logit_bias<I: IntoIterator<Item = (Token, f32)>>(mut self, biases: I) -> Self {
+        for (id, bias) in biases.into_iter() {
+            let Some(i) = self.toks.iter().position(|&t| t == id) else {
+                continue;
+            };
+
+            let logit = bias + self.data.remove(i);
+            self.toks.remove(i);
+
+            self.data.push(f32::NEG_INFINITY);
+            self.toks.push(-1);
+
+            self.insert(id, logit);
+        }
+
+        self
     }
 
     /// Fused numerically stable softmax with temperature.
@@ -107,26 +134,33 @@ impl Output<Probability> {
         self
     }
 
-    /// Convert to a cumulatively weighted probability distribution for sampling.
+    /// Convert to a cumulatively weighted distribution for sampling.
     pub fn distribution(mut self) -> Output<Distribution> {
         let dist = self.data.iter_mut().fold(0., |ac, v| {
             *v += ac;
             *v
         });
 
-        self.data.pop();
+        let k = self.data.len() - 1;
+        self.data.truncate(k);
+
         self.with(Distribution(dist))
+    }
+
+    /// Get an iterator over tokens and their log probabilities.
+    pub fn logprobs(&self) -> impl Iterator<Item = (Token, f32)> + '_ {
+        iter::zip(&self.toks, &self.data).map(|x| (*x.0, x.1.ln()))
     }
 }
 
 impl Output<Distribution> {
     /// Sample a token from this distribution with the thread-local rng.
-    pub fn sample(&self) -> Token {
+    pub fn sample(&self) -> (usize, Token) {
         self.sample_rng(&mut thread_rng())
     }
 
     /// Sample a token from this distribution with the provided rng.
-    pub fn sample_rng<R: Rng>(&self, rng: &mut R) -> Token {
+    pub fn sample_rng<R: Rng>(&self, rng: &mut R) -> (usize, Token) {
         let w = rng.gen_range(0. ..self.mark.0);
 
         let i = self
@@ -134,6 +168,6 @@ impl Output<Distribution> {
             .binary_search_by(|&v| if v <= w { Less } else { Greater })
             .unwrap_err();
 
-        self.toks[i]
+        (i, self.toks[i])
     }
 }

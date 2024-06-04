@@ -11,14 +11,16 @@ use futures::channel::oneshot as ones;
 use futures::sink::SinkExt;
 use llama_sys::sampling::{Logit, Output};
 use llama_sys::{Context, ContextParams, Model, ModelParams, Token, Tokenizer};
+use once_cell::sync::OnceCell;
 use rocket::http::Status;
 use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::{json, Json, Value};
 use rocket::serde::{Deserialize, Serialize};
 use rocket::tokio::task::{spawn_blocking, JoinHandle};
-use rocket::{Request, Route, State};
+use rocket::{Route, State};
 use serde_json::Map;
 use validator::Validate;
+use validator::ValidationError;
 
 use super::prompt::Vocab;
 use super::radix::{Radix, RadixKv};
@@ -29,20 +31,19 @@ pub fn routes() -> Vec<Route> {
 
 type Fail = (Status, Json<Value>);
 
-#[catch(default)]
-pub fn catch(status: Status, _: &Request) -> Fail {
-    fail(status, "unknown")
+// TODO: actually follow the openai error resp structure properly
+fn fail<R: AsRef<str>>(status: Status, desc: R) -> Fail {
+    // TODO: match the rocket handler for consistency
+    (status, Json(json! {{"reason": desc.as_ref()}}))
 }
 
-fn fail<R: AsRef<str>>(status: Status, reason: R) -> Fail {
-    (status, Json(json! {{"reason": reason.as_ref()}}))
-}
-
+// TODO: move req/resp to demesne lib, and make all of these iso Serialize / Deserialize
 #[derive(Deserialize, Validate)]
 pub struct CompletionReq<'a> {
     #[serde(borrow)]
     messages: Vec<Message<'a>>,
 
+    #[validate(range(min = 1))]
     max_tokens: Option<usize>, // default cx-input; # of tokens to infer
 
     #[validate(range(min = 1))]
@@ -60,26 +61,44 @@ pub struct CompletionReq<'a> {
     #[validate(range(min = 0., max = 1.))]
     min_s: Option<f32>, // default 0
 
-    // NOTE(valid): vals must be (-100, 100)
+    #[validate(custom(function = "validate_logit_bias"))]
     logit_bias: Option<HashMap<Token, f32>>,
 
     #[serde(default)]
     logprobs: bool,
 
     #[validate(range(min = 0, max = 20))]
-    top_logprobs: Option<usize>, // default NONE; requires logprobs
+    top_logprobs: Option<usize>, // default 0; requires logprobs
 
+    // TODO: impl
     #[serde(default)]
     response_format: Format,
 
+    // TODO: impl
     stop: Option<Stop<'a>>,
 
+    // TODO: impl
     tools: Option<Vec<Tool<'a>>>,
 
+    // TODO: impl
     tool_choice: Option<ToolChoice<'a>>, // default "auto"
 
     // TODO: stream_options for include usage on streams
     stream: Option<bool>, // default false
+}
+
+fn validate_logit_bias(logit_bias: &HashMap<Token, f32>) -> Result<(), ValidationError> {
+    if logit_bias
+        .values()
+        .any(|bias| !(-100. ..=100.).contains(bias))
+    {
+        let e = ValidationError::new("logit_bias_range")
+            .with_message("logit biases must be in range (-100, 100)".into());
+
+        return Err(e);
+    }
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -217,9 +236,25 @@ enum RespMessage {
     },
 }
 
-// TODO: finish
 #[derive(Serialize)]
-struct LogProbs {}
+struct LogProbs {
+    content: Vec<SampledLogProb>,
+}
+
+#[derive(Serialize)]
+struct SampledLogProb {
+    token: Arc<str>,
+    logprob: f32,
+    bytes: Arc<[u8]>,
+    top_logprobs: Vec<TokenLogProb>,
+}
+
+#[derive(Serialize)]
+struct TokenLogProb {
+    token: Arc<str>,
+    logprob: f32,
+    bytes: Arc<[u8]>,
+}
 
 #[derive(Serialize)]
 struct Usage {
@@ -294,25 +329,33 @@ async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> Cha
     let q = min(k / n, api.n_train - span.len());
     let n_infer = min(req.max_tokens.unwrap_or(q), q);
 
-    let p = Inflight {
+    let mut p = Inflight {
         temp: req.temperature.unwrap_or(1.),
         min_p: req.min_p.unwrap_or(0.),
         min_s: req.min_s.unwrap_or(0.),
+        logit_bias: req.logit_bias.into_iter().flatten().collect(),
+        logprobs: req.logprobs,
+        top_logprobs: req.top_logprobs.unwrap_or(0),
+
         n_infill: span.len(),
         n_infer,
         n_actual: 0,
         span: vec![span; n],
         text: vec![vec![]; n],
+        prob: vec![],
+
         finish: vec![(n_infer == 0).then_some("length"); n],
         tx,
     };
+
+    p.prob.resize_with(n, Default::default);
 
     api.schedule(p).await?;
 
     Ok(match rx {
         Either::Left(recv) => Either::Left(
             recv.await
-                .map_err(|_| fail(Status::InternalServerError, "unknown"))?,
+                .map_err(|_| fail(Status::InternalServerError, "canceled"))?,
         ),
 
         Either::Right(recv) => Either::Right(EventStream::from(recv)),
@@ -330,12 +373,16 @@ struct Inflight {
     temp: f32,  // softmax temperature
     min_p: f32, // ratio of max probability to consider min
     min_s: f32, // min ratio of probability steps
+    logit_bias: Vec<(Token, f32)>,
+    logprobs: bool,
+    top_logprobs: usize,
 
     n_infill: usize,       // how much of span is infill?
     n_infer: usize,        // max tokens to infer
     n_actual: usize,       // # tokens actually decoded (noncached)
     span: Vec<Vec<Token>>, // span tokens
     text: Vec<Vec<u8>>,    // detokenized
+    prob: Vec<Vec<SampledLogProb>>,
 
     finish: Vec<Option<&'static str>>, // finish reason of each choice
     tx: Either<Option<ones::Sender<Json<Completion>>>, mpsc::Sender<Event>>,
@@ -352,11 +399,20 @@ impl Inflight {
             .map(|(s, _)| s.as_slice())
     }
 
-    fn accept_logits(&mut self, ctx: &mut Context, logits: Output<Logit>, i: usize) {
+    fn accept(&mut self, ctx: &Context, memo: &TokenCache, logits: Output<Logit>, i: usize) {
         assert!(self.finish[i].is_none(), "accept on disabled span?");
 
-        let tok = logits
-            .softmax(self.temp)
+        let prob = logits
+            .apply_logit_bias(self.logit_bias.iter().copied())
+            .softmax(self.temp);
+
+        // if enabled, grab the top logprobs before truncating & converting the distribution
+        let top_logprobs = self
+            .logprobs
+            .then(|| prob.logprobs().take(20).collect::<Vec<_>>());
+
+        // j indexes into top_logprobs, but may be out of bounds
+        let (j, tok) = prob
             .trunc_k(self.min_p, self.min_s, 1)
             .distribution()
             .sample();
@@ -364,7 +420,24 @@ impl Inflight {
         self.span[i].push(tok);
         ctx.detokenize(&mut self.text[i], tok, false);
 
-        // TODO: stop strings, fsm stuff, etc etc
+        // finish computing logprobs now that we know which token was sampled
+        if let Some(top_logprobs) = top_logprobs {
+            let (token, bytes) = lookup_token(memo, ctx, tok);
+
+            let tlp = SampledLogProb {
+                token,
+                logprob: top_logprobs.get(j).map(|(_, lp)| *lp).unwrap_or(-9999.),
+                bytes,
+                top_logprobs: top_logprobs
+                    .into_iter()
+                    .take(self.top_logprobs)
+                    .map(|(id, lp)| (lookup_token(memo, ctx, id), lp))
+                    .map(|((token, bytes), logprob)| TokenLogProb { token, logprob, bytes })
+                    .collect(),
+            };
+
+            self.prob[i].push(tlp);
+        }
 
         // check stop conds
         if ctx.model().token_is_eog(tok) {
@@ -377,7 +450,9 @@ impl Inflight {
 
         match &mut self.tx {
             Either::Left(tx) if done => {
-                // TODO: tools & logprobs
+                let mut logprobs = self.prob.drain(..).map(|content| LogProbs { content });
+
+                // TODO: tools
                 let choices = iter::zip(&self.finish, &self.text)
                     .enumerate()
                     .map(|(i, (stop, text))| CompletionChoice {
@@ -387,11 +462,10 @@ impl Inflight {
                             content: Some(String::from_utf8_lossy(text).into_owned()),
                             tool_calls: vec![],
                         },
-                        logprobs: None,
+                        logprobs: logprobs.next(),
                     })
                     .collect();
 
-                // TODO: id, timestamp, model, fingerprint, usage
                 let mut usage = Usage {
                     prompt_tokens: self.n_infill,
                     completion_tokens: self.span.iter().map(|s| s.len() - self.n_infill).sum(),
@@ -402,6 +476,7 @@ impl Inflight {
                 usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
                 usage.cache_tokens = usage.total_tokens - self.n_actual;
 
+                // TODO: id, timestamp, model, fingerprint
                 let completion = Completion::Completion {
                     id: "id".to_owned(),
                     choices,
@@ -431,8 +506,8 @@ pub enum Error {
     #[error("failed to allocate context")]
     LoadContext,
 
-    #[error("decode error: {0:?}")]
-    Decode(#[from] llama_sys::Error),
+    #[error("llama error: {0:?}")]
+    Llama(#[from] llama_sys::Error),
 }
 
 pub struct Api {
@@ -444,6 +519,7 @@ pub struct Api {
 }
 
 impl Api {
+    /// Load a gguf model from the filesystem.
     pub fn load<P: AsRef<Path>>(path: P, m: ModelParams, c: ContextParams) -> Result<Self, Error> {
         let model = Model::load_from_file(path, m).ok_or(Error::LoadModel)?;
         let mut ctx = model.context(c).ok_or(Error::LoadContext)?;
@@ -453,6 +529,7 @@ impl Api {
 
         let n_train = model.n_ctx_train();
         let n_cells = ctx.kv_cache_n_cells();
+        let vocab = vec![OnceCell::new(); model.n_vocab() as usize].into();
         let root = ctx.kv_cache_unique_id();
 
         let inner = Arc::new(Mutex::new(Inner {
@@ -461,6 +538,7 @@ impl Api {
             queue: rx,
             sched: vec![],
             cache: RadixKv::new(root),
+            vocab,
         }));
 
         Ok(Self {
@@ -498,12 +576,29 @@ impl Api {
     }
 }
 
+type TokenCache = [OnceCell<(Arc<str>, Arc<[u8]>)>];
+
+fn lookup_token(memo: &TokenCache, ctx: &Context, id: Token) -> (Arc<str>, Arc<[u8]>) {
+    let (text, bytes) = &memo[id as usize].get_or_init(|| {
+        let mut bytes = vec![];
+        ctx.detokenize(&mut bytes, id, false);
+        bytes.shrink_to_fit();
+
+        let text = String::from_utf8_lossy(&bytes);
+
+        (text.into(), bytes.into())
+    });
+
+    (text.clone(), bytes.clone())
+}
+
 struct Inner {
     ctx: Context,
     n_batch: usize,
     queue: mpsc::Receiver<Inflight>,
     sched: Vec<Inflight>,
     cache: RadixKv,
+    vocab: Arc<TokenCache>,
 }
 
 impl Inner {
@@ -516,6 +611,8 @@ impl Inner {
 
         Ok(())
     }
+
+    // TODO: use tracing to record performance data
 
     fn flush_bounded(&mut self) -> Result<(), Error> {
         // move any new requests to the back of scheduled queue
@@ -609,7 +706,7 @@ impl Inner {
                 assert_eq!(self.cache[a.i].tokens.len(), self.cache[a.i].logits.len(),);
 
                 let logits = self.cache[a.i].logits[a.k - 1].clone();
-                p.accept_logits(&mut self.ctx, logits, j);
+                p.accept(&self.ctx, &self.vocab, logits, j);
             }
 
             if !p.has_enabled() {
