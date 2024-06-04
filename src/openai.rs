@@ -1,10 +1,10 @@
 use std::borrow::Cow;
 use std::cmp::min;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::{iter, mem, str};
 
+use async_openai::types::*;
 use either::Either;
 use futures::channel::mpsc;
 use futures::channel::oneshot as ones;
@@ -14,13 +14,10 @@ use llama_sys::{Context, ContextParams, Model, ModelParams, Token, Tokenizer};
 use once_cell::sync::OnceCell;
 use rocket::http::Status;
 use rocket::response::stream::{Event, EventStream};
-use rocket::serde::json::{json, Json, Value};
-use rocket::serde::{Deserialize, Serialize};
+use rocket::serde::json::{Json, Value};
+use rocket::serde::Serialize;
 use rocket::tokio::task::{spawn_blocking, JoinHandle};
 use rocket::{Route, State};
-use serde_json::Map;
-use validator::Validate;
-use validator::ValidationError;
 
 use super::prompt::Vocab;
 use super::radix::{Radix, RadixKv};
@@ -29,278 +26,124 @@ pub fn routes() -> Vec<Route> {
     routes![chat_completions]
 }
 
-type Fail = (Status, Json<Value>);
-
-// TODO: actually follow the openai error resp structure properly
-fn fail<R: AsRef<str>>(status: Status, desc: R) -> Fail {
-    // TODO: match the rocket handler for consistency
-    (status, Json(json! {{"reason": desc.as_ref()}}))
+#[derive(Serialize, Default)]
+struct ApiError {
+    message: Cow<'static, str>,
+    r#type: Option<Cow<'static, str>>,
+    param: Option<Cow<'static, str>>,
+    code: Option<Cow<'static, str>>,
 }
 
-// TODO: move req/resp to demesne lib, and make all of these iso Serialize / Deserialize
-#[derive(Deserialize, Validate)]
-pub struct CompletionReq<'a> {
-    #[serde(borrow)]
-    messages: Vec<Message<'a>>,
+type Fails = (Status, Json<ApiError>);
 
-    #[validate(range(min = 1))]
-    max_tokens: Option<usize>, // default cx-input; # of tokens to infer
+// TODO: make it better
+fn fails<S: Into<Cow<'static, str>>>(status: Status, message: S) -> Fails {
+    let e = ApiError {
+        message: message.into(),
+        ..Default::default()
+    };
 
-    #[validate(range(min = 1))]
-    n: Option<usize>, // default 1; # of completion choices
-
-    // 0=greedy, 2=insane
-    #[validate(range(min = 0., max = 2.))]
-    temperature: Option<f32>, // default 1
-
-    // 0=top-k, 1=greedy
-    #[validate(range(min = 0., max = 1.))]
-    min_p: Option<f32>, // default 0
-
-    // 0=top-k, 1=greedy
-    #[validate(range(min = 0., max = 1.))]
-    min_s: Option<f32>, // default 0
-
-    #[validate(custom(function = "validate_logit_bias"))]
-    logit_bias: Option<HashMap<Token, f32>>,
-
-    #[serde(default)]
-    logprobs: bool,
-
-    #[validate(range(min = 0, max = 20))]
-    top_logprobs: Option<usize>, // default 0; requires logprobs
-
-    // TODO: impl
-    #[serde(default)]
-    response_format: Format,
-
-    // TODO: impl
-    stop: Option<Stop<'a>>,
-
-    // TODO: impl
-    tools: Option<Vec<Tool<'a>>>,
-
-    // TODO: impl
-    tool_choice: Option<ToolChoice<'a>>, // default "auto"
-
-    // TODO: stream_options for include usage on streams
-    stream: Option<bool>, // default false
+    (status, Json(e))
 }
 
-fn validate_logit_bias(logit_bias: &HashMap<Token, f32>) -> Result<(), ValidationError> {
-    if logit_bias
-        .values()
-        .any(|bias| !(-100. ..=100.).contains(bias))
-    {
-        let e = ValidationError::new("logit_bias_range")
-            .with_message("logit biases must be in range (-100, 100)".into());
-
-        return Err(e);
-    }
-
-    Ok(())
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "role")]
-enum Message<'a> {
-    #[serde(rename = "system")]
-    System {
-        content: Cow<'a, str>,
-        name: Option<Cow<'a, str>>,
-    },
-
-    #[serde(rename = "user")]
-    User {
-        content: Cow<'a, str>,
-        name: Option<Cow<'a, str>>,
-    },
-
-    #[serde(rename = "assistant")]
-    Assistant {
-        content: Cow<'a, str>,
-        name: Option<Cow<'a, str>>,
-        tool_calls: Option<Vec<Call<'a>>>,
-    },
-
-    #[serde(rename = "tool")]
-    Tool {
-        content: Cow<'a, str>,
-        tool_call_id: Cow<'a, str>,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum Call<'a> {
-    #[serde(rename = "function")]
-    Function {
-        id: Cow<'a, str>,
-        function: Function<'a>,
-        index: Option<usize>,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-struct Function<'a> {
-    name: Cow<'a, str>,
-    arguments: Cow<'a, str>,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-#[serde(tag = "type")]
-enum Format {
-    #[default]
-    #[serde(rename = "text")]
-    Text,
-
-    #[serde(rename = "json_object")]
-    JsonObject,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(untagged)]
-enum Stop<'a> {
-    One(&'a str),
-
-    Many(Vec<&'a str>),
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum Tool<'a> {
-    Function {
-        description: Option<&'a str>,
-        name: &'a str,
-        parameters: Option<Map<String, Value>>,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "type")]
-enum ToolChoice<'a> {
-    #[serde(rename = "function")]
-    Function { name: &'a str },
-
-    #[serde(untagged)]
-    Tool(&'a str), // "none" | "auto" | "required"
-}
-
-#[derive(Serialize)]
-#[serde(tag = "object")]
-enum Completion {
-    #[serde(rename = "chat.completion")]
-    Completion {
-        id: String,
-        choices: Vec<CompletionChoice>,
-        created: u64,
-        model: String,
-        system_fingerprint: String,
-        usage: Usage,
-    },
-
-    #[serde(rename = "chat.completion.chunk")]
-    Chunk {
-        id: String,
-        choices: Vec<ChunkChoice>,
-        created: u64,
-        model: String,
-        system_fingerprint: String,
-        usage: Option<Usage>, // only if last && stream include usage is set
-    },
-}
-
-#[derive(Serialize)]
-struct CompletionChoice {
-    finish_reason: &'static str, // "stop" | "length" | "content_filter" | "tool_calls"
-    index: usize,
-    message: RespMessage,
-    logprobs: Option<LogProbs>,
-}
-
-#[derive(Serialize)]
-struct ChunkChoice {
-    finish_reason: Option<&'static str>, // "stop" | "length" | "content_filter" | "tool_calls"
-    index: usize,
-    delta: RespMessage,
-    logprobs: Option<LogProbs>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "role")]
-enum RespMessage {
-    #[serde(rename = "assistant")]
-    Assistant {
-        content: Option<String>,
-        tool_calls: Vec<Call<'static>>,
-    },
-}
-
-#[derive(Serialize)]
-struct LogProbs {
-    content: Vec<SampledLogProb>,
-}
-
-#[derive(Serialize)]
-struct SampledLogProb {
-    token: Arc<str>,
-    logprob: f32,
-    bytes: Arc<[u8]>,
-    top_logprobs: Vec<TokenLogProb>,
-}
-
-#[derive(Serialize)]
-struct TokenLogProb {
-    token: Arc<str>,
-    logprob: f32,
-    bytes: Arc<[u8]>,
-}
-
-#[derive(Serialize)]
-struct Usage {
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    total_tokens: usize,
-    cache_tokens: usize,
-}
-
-type ChatCompletion = Result<Either<Json<Completion>, EventStream<mpsc::Receiver<Event>>>, Fail>;
+type ChatCompletionResponse =
+    Either<Json<CreateChatCompletionResponse>, EventStream<mpsc::Receiver<Event>>>;
 
 #[post("/v1/chat/completions", format = "json", data = "<req>")]
-async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> ChatCompletion {
-    let req = req.into_inner();
+async fn chat_completions(
+    api: &State<Api>,
+    req: Json<CreateChatCompletionRequest>,
+) -> Result<ChatCompletionResponse, Fails> {
+    let r = req.into_inner();
 
-    req.validate()
-        .map_err(|e| Json(serde_json::to_value(e).unwrap()))
-        .map_err(|e| (Status::BadRequest, e))?;
+    if r.messages.is_empty() {
+        return Err(fails(Status::BadRequest, "no messages"));
+    }
+
+    let logit_bias = r.logit_bias.into_iter().flatten().map(|(k, v)| {
+        let id = k
+            .parse::<u32>()
+            .map_err(|_| fails(Status::BadRequest, "invalid token in logit bias"))?;
+
+        let Value::Number(n) = v else {
+            return Err(fails(Status::BadRequest, "bias value is not a number"));
+        };
+
+        let bias = n
+            .as_f64()
+            .ok_or_else(|| fails(Status::BadRequest, "bias value"))?;
+
+        if !(-100. ..=100.).contains(&bias) {
+            return Err(fails(Status::BadRequest, "bias out of range"));
+        }
+
+        Ok((id as Token, bias as f32))
+    });
+
+    let logit_bias: Vec<_> = logit_bias.collect::<Result<_, Fails>>()?;
+
+    let logprobs = r.logprobs.unwrap_or(false);
+
+    if r.top_logprobs.is_some_and(|_| !logprobs) {
+        return Err(fails(Status::BadRequest, "top_logprobs but logprobs=false"));
+    }
+
+    if r.top_logprobs.is_some_and(|n| n > 20) {
+        return Err(fails(Status::BadRequest, "too many logprobs"));
+    }
+
+    let top_logprobs: usize = r.top_logprobs.unwrap_or(0).into();
+
+    if r.temperature.is_some_and(|v| !(0. ..=2.).contains(&v)) {
+        return Err(fails(Status::BadRequest, "temperature out of range"));
+    }
+
+    if r.top_p.is_some_and(|v| !(0. ..=1.).contains(&v)) {
+        return Err(fails(Status::BadRequest, "top_p out of range"));
+    }
 
     let api = api.inner();
     let mut span = vec![api.tk.token_bos()];
 
     let v = Vocab::Llama3;
 
-    for msg in req.messages.iter() {
+    for msg in r.messages.iter() {
         match msg {
-            // NOTE: must be first
-            Message::System { content, name } => {
-                api.feed(&mut span, v.system(), content);
+            ChatCompletionRequestMessage::System(m) => {
+                api.feed(&mut span, v.system(), &m.content);
             }
 
             // NOTE: must be followed by assistant
-            Message::User { content, name } => {
-                api.feed(&mut span, v.user(), content);
-            }
+            ChatCompletionRequestMessage::User(m) => match &m.content {
+                ChatCompletionRequestUserMessageContent::Text(content) => {
+                    api.feed(&mut span, v.user(), content);
+                }
+                ChatCompletionRequestUserMessageContent::Array(_) => {
+                    unimplemented!();
+                }
+            },
 
             // NOTE: always after user
-            Message::Assistant { content, name, tool_calls } => match tool_calls {
-                // TODO(tools): implement
-                Some(calls) => unimplemented!("soon.jpg"),
-                None => api.feed(&mut span, v.assistant(), content),
+            ChatCompletionRequestMessage::Assistant(m) => match (&m.content, &m.tool_calls) {
+                (Some(content), None) => {
+                    api.feed(&mut span, v.assistant(), &content);
+                }
+
+                (None, Some(_tools)) => {
+                    unimplemented!();
+                }
+
+                // TODO: handle errs
+                _ => panic!(),
             },
 
             // TODO(tools): we must create the json object
-            Message::Tool { content, tool_call_id } => {
-                api.feed(&mut span, v.tool_out(), content);
+            ChatCompletionRequestMessage::Tool(m) => {
+                api.feed(&mut span, v.tool_out(), &m.content);
+            }
+
+            ChatCompletionRequestMessage::Function(m) => {
+                unimplemented!();
             }
         }
     }
@@ -308,14 +151,20 @@ async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> Cha
     // TODO(tools): we should not be adding this header, as we may want tool calls
     api.prep(&mut span, v.assistant());
 
+    // token limits
     let n_max = min(api.n_train, api.n_cells);
 
     if span.len() > n_max {
-        let msg = format!("too many infill tokens: {} > {n_max}", span.len());
-        return Err(fail(Status::InsufficientStorage, msg));
+        let msg = format!("too many prompt tokens: {} > {n_max}", span.len());
+        return Err(fails(Status::InsufficientStorage, msg));
     }
 
-    let (tx, rx) = if req.stream.unwrap_or(false) {
+    let k = api.n_cells - span.len();
+    let n: usize = r.n.unwrap_or(1).into();
+    let q = min(k / n, api.n_train - span.len());
+    let n_infer = min(r.max_tokens.map(|v| v as usize).unwrap_or(q), q);
+
+    let (tx, rx) = if r.stream.unwrap_or(false) {
         let (tx, rx) = mpsc::channel(32);
         (Either::Right(tx), Either::Right(rx))
     } else {
@@ -323,19 +172,12 @@ async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> Cha
         (Either::Left(Some(tx)), Either::Left(rx))
     };
 
-    // token limits
-    let k = api.n_cells - span.len();
-    let n = req.n.unwrap_or(1);
-    let q = min(k / n, api.n_train - span.len());
-    let n_infer = min(req.max_tokens.unwrap_or(q), q);
-
     let mut p = Inflight {
-        temp: req.temperature.unwrap_or(1.),
-        min_p: req.min_p.unwrap_or(0.),
-        min_s: req.min_s.unwrap_or(0.),
-        logit_bias: req.logit_bias.into_iter().flatten().collect(),
-        logprobs: req.logprobs,
-        top_logprobs: req.top_logprobs.unwrap_or(0),
+        temperature: r.temperature.unwrap_or(1.),
+        min_s: 1. - r.top_p.unwrap_or(1.),
+        logit_bias,
+        logprobs,
+        top_logprobs,
 
         n_infill: span.len(),
         n_infer,
@@ -344,18 +186,20 @@ async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> Cha
         text: vec![vec![]; n],
         prob: vec![],
 
-        finish: vec![(n_infer == 0).then_some("length"); n],
+        finish: vec![(n_infer == 0).then_some(FinishReason::Length); n],
         tx,
     };
 
-    p.prob.resize_with(n, Default::default);
+    if p.logprobs {
+        p.prob.resize_with(n, Default::default);
+    }
 
     api.schedule(p).await?;
 
     Ok(match rx {
         Either::Left(recv) => Either::Left(
             recv.await
-                .map_err(|_| fail(Status::InternalServerError, "canceled"))?,
+                .map_err(|_| fails(Status::InternalServerError, "cancelled"))?,
         ),
 
         Either::Right(recv) => Either::Right(EventStream::from(recv)),
@@ -370,9 +214,8 @@ async fn chat_completions(api: &State<Api>, req: Json<CompletionReq<'_>>) -> Cha
 // can then further search for CoTs ala https://arxiv.org/pdf/2402.10200
 
 struct Inflight {
-    temp: f32,  // softmax temperature
-    min_p: f32, // ratio of max probability to consider min
-    min_s: f32, // min ratio of probability steps
+    temperature: f32, // softmax temperature
+    min_s: f32,       // min ratio of probability steps
     logit_bias: Vec<(Token, f32)>,
     logprobs: bool,
     top_logprobs: usize,
@@ -382,10 +225,10 @@ struct Inflight {
     n_actual: usize,       // # tokens actually decoded (noncached)
     span: Vec<Vec<Token>>, // span tokens
     text: Vec<Vec<u8>>,    // detokenized
-    prob: Vec<Vec<SampledLogProb>>,
+    prob: Vec<Vec<ChatCompletionTokenLogprob>>,
 
-    finish: Vec<Option<&'static str>>, // finish reason of each choice
-    tx: Either<Option<ones::Sender<Json<Completion>>>, mpsc::Sender<Event>>,
+    finish: Vec<Option<FinishReason>>,
+    tx: Either<Option<ones::Sender<Json<CreateChatCompletionResponse>>>, mpsc::Sender<Event>>,
 }
 
 impl Inflight {
@@ -404,7 +247,7 @@ impl Inflight {
 
         let prob = logits
             .apply_logit_bias(self.logit_bias.iter().copied())
-            .softmax(self.temp);
+            .softmax(self.temperature);
 
         // if enabled, grab the top logprobs before truncating & converting the distribution
         let top_logprobs = self
@@ -413,7 +256,8 @@ impl Inflight {
 
         // j indexes into top_logprobs, but may be out of bounds
         let (j, tok) = prob
-            .trunc_k(self.min_p, self.min_s, 1)
+            // TODO: figure out how to pass min_p, or if we even need it
+            .trunc_k(0., self.min_s, 1)
             .distribution()
             .sample();
 
@@ -424,7 +268,7 @@ impl Inflight {
         if let Some(top_logprobs) = top_logprobs {
             let (token, bytes) = lookup_token(memo, ctx, tok);
 
-            let tlp = SampledLogProb {
+            let tlp = ChatCompletionTokenLogprob {
                 token,
                 logprob: top_logprobs.get(j).map(|(_, lp)| *lp).unwrap_or(-9999.),
                 bytes,
@@ -432,7 +276,7 @@ impl Inflight {
                     .into_iter()
                     .take(self.top_logprobs)
                     .map(|(id, lp)| (lookup_token(memo, ctx, id), lp))
-                    .map(|((token, bytes), logprob)| TokenLogProb { token, logprob, bytes })
+                    .map(|((token, bytes), logprob)| TopLogprobs { token, logprob, bytes })
                     .collect(),
             };
 
@@ -441,49 +285,57 @@ impl Inflight {
 
         // check stop conds
         if ctx.model().token_is_eog(tok) {
-            self.finish[i] = Some("stop");
+            self.finish[i] = Some(FinishReason::Stop);
         } else if self.span[i].len() - self.n_infill >= self.n_infer {
-            self.finish[i] = Some("length");
+            self.finish[i] = Some(FinishReason::Length);
         }
 
         let done = !self.has_enabled();
 
         match &mut self.tx {
             Either::Left(tx) if done => {
-                let mut logprobs = self.prob.drain(..).map(|content| LogProbs { content });
+                let mut logprobs = self
+                    .prob
+                    .drain(..)
+                    .map(|content| ChatChoiceLogprobs { content: Some(content) });
 
                 // TODO: tools
                 let choices = iter::zip(&self.finish, &self.text)
                     .enumerate()
-                    .map(|(i, (stop, text))| CompletionChoice {
-                        finish_reason: stop.unwrap(),
-                        index: i,
-                        message: RespMessage::Assistant {
+                    .map(|(i, (&finish_reason, text))| ChatChoice {
+                        index: i as u32,
+                        message: ChatCompletionResponseMessage {
                             content: Some(String::from_utf8_lossy(text).into_owned()),
-                            tool_calls: vec![],
+                            tool_calls: None,
+                            role: Role::Assistant,
+                            function_call: None,
                         },
+                        finish_reason,
                         logprobs: logprobs.next(),
                     })
                     .collect();
 
-                let mut usage = Usage {
-                    prompt_tokens: self.n_infill,
-                    completion_tokens: self.span.iter().map(|s| s.len() - self.n_infill).sum(),
-                    total_tokens: 0,
-                    cache_tokens: 0,
+                let prompt_tokens = self.n_infill as u32;
+
+                let usage = CompletionUsage {
+                    prompt_tokens,
+                    completion_tokens: self
+                        .span
+                        .iter()
+                        .map(|s| s.len() as u32 - prompt_tokens)
+                        .sum(),
+                    total_tokens: self.n_actual as u32,
                 };
 
-                usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-                usage.cache_tokens = usage.total_tokens - self.n_actual;
-
                 // TODO: id, timestamp, model, fingerprint
-                let completion = Completion::Completion {
+                let completion = CreateChatCompletionResponse {
                     id: "id".to_owned(),
                     choices,
                     created: 0,
                     model: "model".to_owned(),
-                    system_fingerprint: "fingerprint".to_owned(),
-                    usage,
+                    system_fingerprint: None,
+                    object: "chat.completion".to_owned(),
+                    usage: Some(usage),
                 };
 
                 let _ = tx.take().unwrap().send(Json(completion));
@@ -563,12 +415,12 @@ impl Api {
     }
 
     /// Schedule an inflight completion req.
-    async fn schedule(&self, params: Inflight) -> Result<JoinHandle<()>, Fail> {
+    async fn schedule(&self, params: Inflight) -> Result<JoinHandle<()>, Fails> {
         let mut jobs = self.queue.clone();
 
         jobs.send(params)
             .await
-            .map_err(|_| fail(Status::InternalServerError, "failed to schedule span"))?;
+            .map_err(|_| fails(Status::InternalServerError, "failed to schedule span"))?;
 
         let inner = self.inner.clone();
 
@@ -576,9 +428,9 @@ impl Api {
     }
 }
 
-type TokenCache = [OnceCell<(Arc<str>, Arc<[u8]>)>];
+type TokenCache = [OnceCell<(String, Vec<u8>)>];
 
-fn lookup_token(memo: &TokenCache, ctx: &Context, id: Token) -> (Arc<str>, Arc<[u8]>) {
+fn lookup_token(memo: &TokenCache, ctx: &Context, id: Token) -> (String, Option<Vec<u8>>) {
     let (text, bytes) = &memo[id as usize].get_or_init(|| {
         let mut bytes = vec![];
         ctx.detokenize(&mut bytes, id, false);
@@ -586,10 +438,10 @@ fn lookup_token(memo: &TokenCache, ctx: &Context, id: Token) -> (Arc<str>, Arc<[
 
         let text = String::from_utf8_lossy(&bytes);
 
-        (text.into(), bytes.into())
+        (text.into(), bytes)
     });
 
-    (text.clone(), bytes.clone())
+    (text.clone(), Some(bytes.clone()))
 }
 
 struct Inner {
