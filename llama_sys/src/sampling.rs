@@ -103,22 +103,18 @@ impl Output<Probability> {
             .max(min_keep);
 
         self.data.truncate(k);
+        self.toks.truncate(k);
         self
     }
 
     /// Convert to a cumulatively weighted probability distribution for sampling.
     pub fn distribution(mut self) -> Output<Distribution> {
-        if self.data.len() == 1 {
-            return self.with(Distribution(0.));
-        }
-
-        let init = self.data[0];
-
-        let dist = self.data[1..].iter_mut().fold(init, |ac, v| {
-            *v = ac;
-            ac + *v
+        let dist = self.data.iter_mut().fold(0., |ac, v| {
+            *v += ac;
+            *v
         });
 
+        self.data.pop();
         self.with(Distribution(dist))
     }
 }
@@ -131,13 +127,10 @@ impl Output<Distribution> {
 
     /// Sample a token from this distribution with the provided rng.
     pub fn sample_rng<R: Rng>(&self, rng: &mut R) -> Token {
-        if self.data.len() == 1 {
-            return self.toks[0];
-        }
-
         let w = rng.gen_range(0. ..self.mark.0);
 
-        let i = self.data[1..]
+        let i = self
+            .data
             .binary_search_by(|&v| if v <= w { Less } else { Greater })
             .unwrap_err();
 

@@ -52,13 +52,13 @@ pub struct CompletionReq<'a> {
     #[validate(range(min = 0., max = 2.))]
     temperature: Option<f32>, // default 1
 
-    // 0=greedy, 1=all
+    // 0=top-k, 1=greedy
     #[validate(range(min = 0., max = 1.))]
-    min_p: Option<f32>, // default NONE
+    min_p: Option<f32>, // default 0
 
-    // 0=top-1, 1=top-k
+    // 0=top-k, 1=greedy
     #[validate(range(min = 0., max = 1.))]
-    min_s: Option<f32>, // default NONE
+    min_s: Option<f32>, // default 0
 
     // NOTE(valid): vals must be (-100, 100)
     logit_bias: Option<HashMap<Token, f32>>,
