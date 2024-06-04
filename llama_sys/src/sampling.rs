@@ -5,8 +5,6 @@ use rand::{thread_rng, Rng};
 
 use super::Token;
 
-// TODO: regex
-
 /// A k-sparse output distribution optimized for high-throughput sampling.
 #[derive(Clone, Debug)]
 pub struct Output<S> {
