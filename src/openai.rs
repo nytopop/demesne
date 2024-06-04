@@ -113,7 +113,6 @@ async fn chat_completions(
                 api.feed(&mut span, v.system(), &m.content);
             }
 
-            // NOTE: must be followed by assistant
             ChatCompletionRequestMessage::User(m) => match &m.content {
                 ChatCompletionRequestUserMessageContent::Text(content) => {
                     api.feed(&mut span, v.user(), content);
@@ -123,10 +122,9 @@ async fn chat_completions(
                 }
             },
 
-            // NOTE: always after user
             ChatCompletionRequestMessage::Assistant(m) => match (&m.content, &m.tool_calls) {
                 (Some(content), None) => {
-                    api.feed(&mut span, v.assistant(), &content);
+                    api.feed(&mut span, v.assistant(), content);
                 }
 
                 (None, Some(_tools)) => {
@@ -137,7 +135,6 @@ async fn chat_completions(
                 _ => panic!(),
             },
 
-            // TODO(tools): we must create the json object
             ChatCompletionRequestMessage::Tool(m) => {
                 api.feed(&mut span, v.tool_out(), &m.content);
             }
