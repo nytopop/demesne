@@ -1,3 +1,4 @@
 [submodule "llama_sys/llama.cpp"]
-	path = llama_sys/llama.cpp
-	url = https://github.com/ggerganov/llama.cpp
+    path = llama_sys/llama.cpp
+    url = https://github.com/nytopop/llama.cpp
+    branch = control
