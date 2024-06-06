@@ -14,7 +14,7 @@ cuda = ["llama_sys/cuda"]
 
 [dependencies]
 llama_sys    = { path = "llama_sys" }
-async-openai = { git = "https://github.com/nytopop/async-openai" }
+async-openai = { git = "https://github.com/nytopop/async-openai", branch = "fixes" }
 
 petgraph           = { version = "0.6.5", features = ["stable_graph"] }
 structopt          = "0.3.26"
