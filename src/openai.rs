@@ -151,6 +151,7 @@ async fn chat_completions(
                 ChatCompletionRequestUserMessageContent::Text(content) => {
                     api.feed(&mut span, v.user(), content);
                 }
+
                 ChatCompletionRequestUserMessageContent::Array(_) => {
                     unimplemented!();
                 }
@@ -161,25 +162,23 @@ async fn chat_completions(
                     api.feed(&mut span, v.assistant(), content);
                 }
 
-                (None, Some(_tools)) => {
-                    unimplemented!();
-                }
-
-                // TODO: handle errs
-                _ => panic!(),
+                // TODO(tools): finish
+                (Some(_content), Some(_tools)) => {}
+                (None, Some(_tools)) => {}
+                (None, None) => {}
             },
 
             ChatCompletionRequestMessage::Tool(m) => {
                 api.feed(&mut span, v.tool_out(), &m.content);
             }
 
-            ChatCompletionRequestMessage::Function(m) => {
-                unimplemented!();
+            ChatCompletionRequestMessage::Function(_) => {
+                return Err(fails(Status::NotImplemented, "unimplemented"));
             }
         }
     }
 
-    // TODO(tools): we should not be adding this header, as we may want tool calls
+    // TODO(tools): we should not be adding this header yet, as we may want tool calls
     api.prep(&mut span, v.assistant());
 
     // token limits
@@ -236,13 +235,6 @@ async fn chat_completions(
         Either::Right(recv) => Either::Right(EventStream::from(recv)),
     })
 }
-
-// TODO(shift): support priveleged 'sliding window' type spans
-
-// TODO(beam-search): modifications needed aren't huge:
-// - decoding logic is unchanged
-// - we already store space for beams (choices)
-// can then further search for CoTs ala https://arxiv.org/pdf/2402.10200
 
 struct Inflight {
     temperature: f32, // softmax temperature
@@ -314,7 +306,8 @@ impl Inflight {
             self.prob[i].push(tlp);
         }
 
-        // check stop conds
+        // TODO: stop sequences
+
         if ctx.model().token_is_eog(tok) {
             self.finish[i] = Some(FinishReason::Stop);
         } else if self.span[i].len() - self.n_infill >= self.n_infer {
@@ -331,6 +324,8 @@ impl Inflight {
                     .map(|content| ChatChoiceLogprobs { content: Some(content) });
 
                 // TODO: tools
+
+                #[allow(deprecated)]
                 let choices = iter::zip(&self.finish, &self.text)
                     .enumerate()
                     .map(|(i, (&finish_reason, text))| ChatChoice {
@@ -592,6 +587,7 @@ impl Inner {
                     continue;
                 }
 
+                // sanity check
                 assert_eq!(a.n, span.len());
                 assert_eq!(self.cache[a.i].tokens.len(), self.cache[a.i].logits.len(),);
 
