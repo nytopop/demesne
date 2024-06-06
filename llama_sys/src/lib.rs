@@ -752,7 +752,7 @@ impl Context {
 
     /// Defragment the kv cache.
     pub fn kv_cache_defrag(&mut self) {
-        unsafe { sys::llama_kv_cache_update(self.ctx) }
+        unsafe { sys::llama_kv_cache_defrag(self.ctx) }
     }
 
     /// Apply any pending kv cache operations (K-shifts, defrag, etc).
