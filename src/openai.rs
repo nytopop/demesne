@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::{iter, mem, str};
 
 use async_openai::types::*;
+use constant_time_eq::constant_time_eq;
 use either::Either;
 use futures::channel::mpsc;
 use futures::channel::oneshot as ones;
@@ -13,11 +14,13 @@ use llama_sys::sampling::{Logit, Output};
 use llama_sys::{Context, ContextParams, Model, ModelParams, Token, Tokenizer};
 use once_cell::sync::OnceCell;
 use rocket::http::Status;
+use rocket::request::FromRequest;
+use rocket::request::Outcome;
 use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::{Json, Value};
 use rocket::serde::Serialize;
 use rocket::tokio::task::{spawn_blocking, JoinHandle};
-use rocket::{Route, State};
+use rocket::{Request, Route, State};
 
 use super::prompt::Vocab;
 use super::radix::{Radix, RadixKv};
@@ -26,7 +29,7 @@ pub fn routes() -> Vec<Route> {
     routes![chat_completions]
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, Debug)]
 struct ApiError {
     message: Cow<'static, str>,
     r#type: Option<Cow<'static, str>>,
@@ -46,14 +49,45 @@ fn fails<S: Into<Cow<'static, str>>>(status: Status, message: S) -> Fails {
     (status, Json(e))
 }
 
-type ChatCompletionResponse =
-    Either<Json<CreateChatCompletionResponse>, EventStream<mpsc::Receiver<Event>>>;
+struct Authorized<'r> {
+    key: Option<&'r str>,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Authorized<'r> {
+    type Error = Json<ApiError>;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let api = req.rocket().state::<Api>().unwrap();
+
+        let Some(srv_key) = api.api_key.as_deref() else {
+            return Outcome::Success(Authorized { key: None });
+        };
+
+        let key = req
+            .headers()
+            .get("authorization")
+            .next()
+            .and_then(|key| key.strip_prefix("Bearer "));
+
+        let Some(key) = key else {
+            return Outcome::Error(fails(Status::Unauthorized, "malformed or missing api key"));
+        };
+
+        if !constant_time_eq(key.as_bytes(), srv_key.as_bytes()) {
+            return Outcome::Error(fails(Status::Unauthorized, "malformed or missing api key"));
+        }
+
+        Outcome::Success(Authorized { key: Some(key) })
+    }
+}
 
 #[post("/v1/chat/completions", format = "json", data = "<req>")]
 async fn chat_completions(
+    _auth: Authorized<'_>,
     api: &State<Api>,
     req: Json<CreateChatCompletionRequest>,
-) -> Result<ChatCompletionResponse, Fails> {
+) -> Result<Either<Json<CreateChatCompletionResponse>, EventStream<mpsc::Receiver<Event>>>, Fails> {
     let r = req.into_inner();
 
     if r.messages.is_empty() {
@@ -365,11 +399,17 @@ pub struct Api {
     tk: Tokenizer,
     n_train: usize,
     n_cells: usize,
+    api_key: Option<String>,
 }
 
 impl Api {
     /// Load a gguf model from the filesystem.
-    pub fn load<P: AsRef<Path>>(path: P, m: ModelParams, c: ContextParams) -> Result<Self, Error> {
+    pub fn load<P: AsRef<Path>>(
+        api_key: Option<String>,
+        path: P,
+        m: ModelParams,
+        c: ContextParams,
+    ) -> Result<Self, Error> {
         let model = Model::load_from_file(path, m).ok_or(Error::LoadModel)?;
         let mut ctx = model.context(c).ok_or(Error::LoadContext)?;
         let tk = model.tokenizer();
@@ -396,6 +436,7 @@ impl Api {
             tk,
             n_train,
             n_cells,
+            api_key,
         })
     }
 

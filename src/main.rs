@@ -98,11 +98,8 @@ async fn main() -> Result<(), rocket::Error> {
         ..Default::default()
     };
 
-    // TODO: api key
-    // TODO: limits by api key
-
     rocket::custom(config)
-        .manage(openai::Api::load(o.model_path, m, c).unwrap())
+        .manage(openai::Api::load(o.api_key, o.model_path, m, c).unwrap())
         .mount("/", openai::routes())
         .launch()
         .await?;
