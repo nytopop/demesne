@@ -8,11 +8,11 @@ use async_openai::types::*;
 use constant_time_eq::constant_time_eq;
 use either::Either;
 use futures::channel::mpsc;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::channel::oneshot as ones;
 use futures::sink::SinkExt;
 use llama_sys::sampling::{Logit, Output};
 use llama_sys::{Context, ContextParams, Model, ModelParams, Token, Tokenizer};
-use once_cell::sync::OnceCell;
 use rocket::http::Status;
 use rocket::request::FromRequest;
 use rocket::request::Outcome;
@@ -87,7 +87,8 @@ async fn chat_completions(
     _auth: Authorized<'_>,
     api: &State<Api>,
     req: Json<CreateChatCompletionRequest>,
-) -> Result<Either<Json<CreateChatCompletionResponse>, EventStream<mpsc::Receiver<Event>>>, Fails> {
+) -> Result<Either<Json<CreateChatCompletionResponse>, EventStream<UnboundedReceiver<Event>>>, Fails>
+{
     let r = req.into_inner();
 
     if r.messages.is_empty() {
@@ -194,12 +195,14 @@ async fn chat_completions(
     let q = min(k / n, api.n_train - span.len());
     let n_infer = min(r.max_tokens.map(|v| v as usize).unwrap_or(q), q);
 
-    let (tx, rx) = if r.stream.unwrap_or(false) {
-        let (tx, rx) = mpsc::channel(32);
-        (Either::Right(tx), Either::Right(rx))
+    let (tx, rx, stream_usage) = if r.stream.unwrap_or(false) {
+        let (tx, rx) = mpsc::unbounded();
+        let usage = r.stream_options.map(|o| o.include_usage).unwrap_or(false);
+
+        (Either::Right(tx), Either::Right(rx), usage)
     } else {
         let (tx, rx) = ones::channel();
-        (Either::Left(Some(tx)), Either::Left(rx))
+        (Either::Left(Some(tx)), Either::Left(rx), false)
     };
 
     let mut p = Inflight {
@@ -212,10 +215,14 @@ async fn chat_completions(
         n_infill: span.len(),
         n_infer,
         n_actual: 0,
+
         span: vec![span; n],
         text: vec![vec![]; n],
         prob: vec![],
+        dirty: vec![false; n],
+        first: vec![true; n],
 
+        stream_usage,
         finish: vec![(n_infer == 0).then_some(FinishReason::Length); n],
         tx,
     };
@@ -243,15 +250,20 @@ struct Inflight {
     logprobs: bool,
     top_logprobs: usize,
 
-    n_infill: usize,       // how much of span is infill?
-    n_infer: usize,        // max tokens to infer
-    n_actual: usize,       // # tokens actually decoded (noncached)
-    span: Vec<Vec<Token>>, // span tokens
-    text: Vec<Vec<u8>>,    // detokenized
-    prob: Vec<Vec<ChatCompletionTokenLogprob>>,
+    n_infill: usize, // how much of span is infill?
+    n_infer: usize,  // max tokens to infer
+    n_actual: usize, // # tokens actually decoded (noncached)
 
+    // all of the following are indexed by span
+    span: Vec<Vec<Token>>,
+    text: Vec<Vec<u8>>,
+    prob: Vec<Vec<ChatCompletionTokenLogprob>>,
+    dirty: Vec<bool>,
+    first: Vec<bool>,
+
+    stream_usage: bool,
     finish: Vec<Option<FinishReason>>,
-    tx: Either<Option<ones::Sender<Json<CreateChatCompletionResponse>>>, mpsc::Sender<Event>>,
+    tx: Either<Option<ones::Sender<Json<CreateChatCompletionResponse>>>, UnboundedSender<Event>>,
 }
 
 impl Inflight {
@@ -265,7 +277,7 @@ impl Inflight {
             .map(|(s, _)| s.as_slice())
     }
 
-    fn accept(&mut self, ctx: &Context, memo: &TokenCache, logits: Output<Logit>, i: usize) {
+    fn accept(&mut self, ctx: &Context, logits: Output<Logit>, i: usize) {
         assert!(self.finish[i].is_none(), "accept on disabled span?");
 
         let prob = logits
@@ -286,10 +298,19 @@ impl Inflight {
 
         self.span[i].push(tok);
         ctx.detokenize(&mut self.text[i], tok, false);
+        self.dirty[i] = true;
 
         // finish computing logprobs now that we know which token was sampled
         if let Some(top_logprobs) = top_logprobs {
-            let (token, bytes) = lookup_token(memo, ctx, tok);
+            let detok = |id| {
+                let mut bytes = Vec::with_capacity(16);
+                ctx.detokenize(&mut bytes, id, false);
+                let token = String::from_utf8_lossy(&bytes).into_owned();
+
+                (token, Some(bytes))
+            };
+
+            let (token, bytes) = detok(tok);
 
             let tlp = ChatCompletionTokenLogprob {
                 token,
@@ -298,7 +319,7 @@ impl Inflight {
                 top_logprobs: top_logprobs
                     .into_iter()
                     .take(self.top_logprobs)
-                    .map(|(id, lp)| (lookup_token(memo, ctx, id), lp))
+                    .map(|(id, lp)| (detok(id), lp))
                     .map(|((token, bytes), logprob)| TopLogprobs { token, logprob, bytes })
                     .collect(),
             };
@@ -313,65 +334,122 @@ impl Inflight {
         } else if self.span[i].len() - self.n_infill >= self.n_infer {
             self.finish[i] = Some(FinishReason::Length);
         }
+    }
 
+    fn accept_and_complete(&mut self) -> bool {
         let done = !self.has_enabled();
 
-        match &mut self.tx {
-            Either::Left(tx) if done => {
-                let mut logprobs = self
-                    .prob
-                    .drain(..)
-                    .map(|content| ChatChoiceLogprobs { content: Some(content) });
+        let mut logprobs = self
+            .prob
+            .iter_mut()
+            .map(mem::take)
+            .map(|content| ChatChoiceLogprobs { content: Some(content) });
 
-                // TODO: tools
+        let choices = iter::zip(self.finish.iter(), self.text.iter_mut())
+            .enumerate()
+            .map(|(i, (finish_reason, text))| (i, finish_reason, text, logprobs.next()));
 
-                #[allow(deprecated)]
-                let choices = iter::zip(&self.finish, &self.text)
-                    .enumerate()
-                    .map(|(i, (&finish_reason, text))| ChatChoice {
-                        index: i as u32,
-                        message: ChatCompletionResponseMessage {
-                            content: Some(String::from_utf8_lossy(text).into_owned()),
-                            tool_calls: None,
-                            role: Role::Assistant,
-                            function_call: None,
-                        },
-                        finish_reason,
-                        logprobs: logprobs.next(),
-                    })
-                    .collect();
+        if self.tx.is_left() && done {
+            // TODO: tools
+            #[allow(deprecated)]
+            let choices = choices.map(|(i, &finish_reason, text, logprobs)| ChatChoice {
+                index: i as u32,
+                message: ChatCompletionResponseMessage {
+                    content: Some(String::from_utf8_lossy(text).into_owned()),
+                    tool_calls: None,
+                    role: Role::Assistant,
+                    function_call: None,
+                },
+                finish_reason,
+                logprobs,
+            });
 
-                let prompt_tokens = self.n_infill as u32;
+            let choices = choices.collect();
+            drop(logprobs);
 
-                let usage = CompletionUsage {
-                    prompt_tokens,
-                    completion_tokens: self
-                        .span
-                        .iter()
-                        .map(|s| s.len() as u32 - prompt_tokens)
-                        .sum(),
-                    total_tokens: self.n_actual as u32,
-                };
+            // TODO: id, timestamp, model, fingerprint
+            let resp = CreateChatCompletionResponse {
+                id: "id".to_owned(),
+                choices,
+                created: 0,
+                model: "model".to_owned(),
+                system_fingerprint: None,
+                object: "chat.completion".to_owned(),
+                usage: Some(self.compute_usage()),
+            };
 
-                // TODO: id, timestamp, model, fingerprint
-                let completion = CreateChatCompletionResponse {
-                    id: "id".to_owned(),
-                    choices,
-                    created: 0,
-                    model: "model".to_owned(),
-                    system_fingerprint: None,
-                    object: "chat.completion".to_owned(),
-                    usage: Some(usage),
-                };
+            let tx = self.tx.as_mut().unwrap_left();
+            let _r = tx.take().unwrap().send(Json(resp));
 
-                let _ = tx.take().unwrap().send(Json(completion));
+            return done;
+        }
+
+        if self.tx.is_right() {
+            let choices = choices.filter(|c| mem::replace(&mut self.dirty[c.0], false));
+
+            #[allow(deprecated)]
+            let choices = choices.map(|(i, &finish_reason, text, logprobs)| {
+                let content = Some(String::from_utf8_lossy(text).into_owned());
+                text.clear();
+
+                let role = mem::replace(&mut self.first[i], false).then_some(Role::Assistant);
+
+                ChatChoiceStream {
+                    index: i as u32,
+                    delta: ChatCompletionStreamResponseDelta {
+                        content,
+                        tool_calls: None,
+                        role,
+                        function_call: None,
+                    },
+                    finish_reason,
+                    logprobs,
+                }
+            });
+
+            let mut resp = CreateChatCompletionStreamResponse {
+                id: "".to_owned(),
+                choices: choices.collect(),
+                created: 0,
+                model: "".to_owned(),
+                system_fingerprint: None,
+                object: "chat.completion.chunk".to_owned(),
+                usage: self.stream_usage.then_some(None),
+            };
+
+            let tx = self.tx.as_ref().unwrap_right();
+
+            if tx.unbounded_send(Event::json(&resp)).is_err() && !done {
+                return true;
             }
 
-            Either::Right(tx) => {
-                //let _ = tx.try_send(Event::json(&Completion::Chunk {}));
+            if done && self.stream_usage {
+                resp.choices.clear();
+                resp.usage = Some(Some(self.compute_usage()));
+                let _ = tx.unbounded_send(Event::json(&resp));
             }
 
-            _ => {}
+            if done {
+                let _ = tx.unbounded_send(Event::data("[DONE]"));
+            }
+        }
+
+        done
+    }
+
+    fn compute_usage(&self) -> CompletionUsage {
+        let prompt_tokens = self.n_infill as u32;
+
+        CompletionUsage {
+            prompt_tokens,
+
+            completion_tokens: self
+                .span
+                .iter()
+                .map(|s| s.len() as u32 - prompt_tokens)
+                .sum(),
+
+            total_tokens: self.n_actual as u32,
         }
     }
 }
@@ -413,7 +491,6 @@ impl Api {
 
         let n_train = model.n_ctx_train();
         let n_cells = ctx.kv_cache_n_cells();
-        let vocab = vec![OnceCell::new(); model.n_vocab() as usize].into();
         let root = ctx.kv_cache_unique_id();
 
         let inner = Arc::new(Mutex::new(Inner {
@@ -422,7 +499,6 @@ impl Api {
             queue: rx,
             sched: vec![],
             cache: RadixKv::new(root),
-            vocab,
         }));
 
         Ok(Self {
@@ -461,29 +537,12 @@ impl Api {
     }
 }
 
-type TokenCache = [OnceCell<(String, Vec<u8>)>];
-
-fn lookup_token(memo: &TokenCache, ctx: &Context, id: Token) -> (String, Option<Vec<u8>>) {
-    let (text, bytes) = &memo[id as usize].get_or_init(|| {
-        let mut bytes = vec![];
-        ctx.detokenize(&mut bytes, id, false);
-        bytes.shrink_to_fit();
-
-        let text = String::from_utf8_lossy(&bytes);
-
-        (text.into(), bytes)
-    });
-
-    (text.clone(), Some(bytes.clone()))
-}
-
 struct Inner {
     ctx: Context,
     n_batch: usize,
     queue: mpsc::Receiver<Inflight>,
     sched: Vec<Inflight>,
     cache: RadixKv,
-    vocab: Arc<TokenCache>,
 }
 
 impl Inner {
@@ -506,6 +565,7 @@ impl Inner {
         }
 
         // compute how much kv space may be allocated to each scheduled span
+        // BUG: something here isn't correct, overflows w/ slot error (offby1?)
         let mut plan = Radix::new();
         let mut left = self.ctx.kv_cache_n_cells();
         let mut k = 0; // # of params that fit
@@ -592,10 +652,10 @@ impl Inner {
                 assert_eq!(self.cache[a.i].tokens.len(), self.cache[a.i].logits.len(),);
 
                 let logits = self.cache[a.i].logits[a.k - 1].clone();
-                p.accept(&self.ctx, &self.vocab, logits, j);
+                p.accept(&self.ctx, logits, j);
             }
 
-            if !p.has_enabled() {
+            if p.accept_and_complete() {
                 gc.push(i);
             }
         }
