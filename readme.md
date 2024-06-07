@@ -2,21 +2,15 @@
 An OpenAI API compatible inference server built on llama.cpp that (hopefully) doesn't suck.
 
 # another? why?
-The aim of this project is reliably serving high-throughput inference on typical edge hardware. Lacking
-a current gen datacenter GPU shouldn't lock you out of critical performance features.
+The aim of this project is reliably serving high-throughput inference on typical edge hardware. Lacking a current gen datacenter GPU shouldn't lock you out of critical performance features.
 
 No tensor cores? No problem.
 
-In demesne, we assume by default that system performance is limited somehow. Maybe you're on pascal, or
-gfx906, or some CPU/APU with DDR memory. In any case, we apply various techniques to speed things up.
+In demesne, we assume by default that system performance is limited somehow. Maybe you're on pascal, or gfx906, or some CPU/APU with DDR memory. In any case, we apply various techniques to speed things up.
 
-First, continuous batching is practically a given if you want high-throughput from an LLM. We implement
-it as a matter of course.
+First, continuous batching is practically a given if you want high-throughput from an LLM. We implement it as a matter of course.
 
-Second, transparent prefix elision. Much like [sglang][0], we maintain a radix trie over in-flight reqs
-and decode shared prefixes at most once. This variant however, is outwardly stateless and doesn't force
-clients to explicitly utilize it: simply send the entire context with each API call as per usual OpenAI
-API flow and get the performance gains with 0 effort.
+Next, transparent prefix elision. Much like [sglang][0], we maintain a radix trie over in-flight completions and decode shared prefixes at most once. This variant however, is outwardly stateless and doesn't force clients to explicitly utilize it: simply send the entire context with each API call as per usual OpenAI API flow and get the performance gains with 0 effort.
 
 [0]: https://lmsys.org/blog/2024-01-17-sglang/
 
