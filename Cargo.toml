@@ -1,9 +1,9 @@
 [workspace]
-members  = ["llama_sys"]
+members = ["llama_sys"]
 resolver = "2"
 
 [package]
-name    = "demesne"
+name = "demesne"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -13,17 +13,17 @@ rocm = ["llama_sys/rocm"]
 cuda = ["llama_sys/cuda"]
 
 [dependencies]
-llama_sys    = { path = "llama_sys" }
+llama_sys = { path = "llama_sys" }
 async-openai = { git = "https://github.com/nytopop/async-openai", branch = "fixes" }
 
-petgraph           = { version = "0.6.5", features = ["stable_graph"] }
-structopt          = "0.3.26"
-futures            = "0.3.30"
-tracing            = "0.1.40"
+petgraph = { version = "0.6.5", features = ["stable_graph"] }
+structopt = "0.3.26"
+futures = "0.3.30"
+tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-rocket             = { version = "0.5", features = ["json"] }
-serde              = { version = "1.0", features = ["derive"] }
-either             = "1.12.0"
-thiserror          = "1.0.61"
-num_cpus           = "1.16"
-constant_time_eq   = "0.3.0"
+rocket = { version = "0.5", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+either = "1.12.0"
+thiserror = "1.0.61"
+num_cpus = "1.16"
+constant_time_eq = "0.3.0"
