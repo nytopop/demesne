@@ -169,11 +169,15 @@ impl RadixKv {
             fifo.extend(self.g.neighbors(i));
         }
 
-        let max = ctx.kv_cache_n_cells();
+        let mut max = ctx.kv_cache_n_cells();
 
         if size < max {
             return;
         }
+
+        // free more than we need to amortize the cost of defrags a bit
+        let k = ctx.n_batch() as usize * 3;
+        max = max.saturating_sub(k);
 
         // find indices along each skip
         let mut path = HashSet::new();
