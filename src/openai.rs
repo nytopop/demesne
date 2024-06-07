@@ -25,10 +25,6 @@ use rocket::{Request, Route, State};
 use super::prompt::Vocab;
 use super::radix::{Radix, RadixKv};
 
-pub fn routes() -> Vec<Route> {
-    routes![chat_completions]
-}
-
 #[derive(Serialize, Default, Debug)]
 struct ApiError {
     message: Cow<'static, str>,
@@ -80,6 +76,10 @@ impl<'r> FromRequest<'r> for Authorized<'r> {
 
         Outcome::Success(Authorized { key: Some(key) })
     }
+}
+
+pub fn routes() -> Vec<Route> {
+    routes![chat_completions]
 }
 
 #[post("/v1/chat/completions", format = "json", data = "<req>")]
@@ -140,7 +140,7 @@ async fn chat_completions(
     let api = api.inner();
     let mut span = vec![api.tk.token_bos()];
 
-    let v = Vocab::Llama3;
+    let v = api.vocab;
 
     for msg in r.messages.iter() {
         match msg {
@@ -473,6 +473,7 @@ pub struct Api {
     n_train: usize,
     n_cells: usize,
     api_key: Option<String>,
+    vocab: Vocab,
 }
 
 impl Api {
@@ -482,6 +483,7 @@ impl Api {
         path: P,
         m: ModelParams,
         c: ContextParams,
+        vocab: Vocab,
     ) -> Result<Self, Error> {
         let model = Model::load_from_file(path, m).ok_or(Error::LoadModel)?;
         let mut ctx = model.context(c).ok_or(Error::LoadContext)?;
@@ -508,6 +510,7 @@ impl Api {
             n_train,
             n_cells,
             api_key,
+            vocab,
         })
     }
 

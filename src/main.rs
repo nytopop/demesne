@@ -51,6 +51,10 @@ struct Opts {
     /// api key to access the api
     #[structopt(short = "k", long = "api-key", name = "api-key")]
     api_key: Option<String>,
+
+    /// override vocab kind (mis3 | l3 | phi3 | cml)
+    #[structopt(short = "v", long = "vocab", name = "vocab", default_value = "cml")]
+    vocab: prompt::Vocab,
 }
 
 #[rocket::main]
@@ -98,7 +102,7 @@ async fn main() -> Result<(), rocket::Error> {
     };
 
     rocket::custom(config)
-        .manage(openai::Api::load(o.api_key, o.model_path, m, c).unwrap())
+        .manage(openai::Api::load(o.api_key, o.model_path, m, c, o.vocab).unwrap())
         .mount("/", openai::routes())
         .launch()
         .await?;
