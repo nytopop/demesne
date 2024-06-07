@@ -599,14 +599,13 @@ impl Inner {
 
         let mut actual = Vec::with_capacity(sched.len());
 
+        let it = sched
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| p.enabled().map(move |s| (i, s)));
+
         // distribute (inexact in the case of shared prefixes)
-        for (m, (i, span)) in iter::zip(
-            clamp_sum(self.n_batch, &bounds, |&n| n),
-            sched
-                .iter()
-                .enumerate()
-                .flat_map(|(i, p)| p.enabled().map(move |s| (i, s))),
-        ) {
+        for (m, (i, span)) in iter::zip(clamp_sum(self.n_batch, &bounds, |&n| n), it) {
             if m == 0 {
                 continue;
             }
