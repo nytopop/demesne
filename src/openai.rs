@@ -565,7 +565,6 @@ impl Inner {
         }
 
         // compute how much kv space may be allocated to each scheduled span
-        // BUG: something here isn't correct, overflows w/ slot error (offby1?)
         let mut plan = Radix::new();
         let mut left = self.ctx.kv_cache_n_cells();
         let mut k = 0; // # of params that fit
