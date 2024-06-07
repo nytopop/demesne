@@ -183,7 +183,7 @@ impl RadixKv {
         }
 
         // get to deleting spans in reverse bfs order until left == 0
-        let mut left = max - size;
+        let mut left = size - max;
         fifo.extend(self.g.externals(Direction::Outgoing));
 
         while let Some(i) = fifo.pop_front() {
@@ -226,6 +226,8 @@ impl RadixKv {
 
             left -= n;
         }
+
+        ctx.kv_cache_defrag();
     }
 
     pub fn pending_batch(&self) -> Vec<EvalReq> {

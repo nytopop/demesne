@@ -89,8 +89,7 @@ async fn main() -> Result<(), rocket::Error> {
         .n_ubatch(o.n_batch)
         .n_threads(n_cpu)
         .n_threads_batch(n_cpu)
-        .flash_attn(o.flash_attn)
-        .defrag_threshold(0.1);
+        .flash_attn(o.flash_attn);
 
     let config = rocket::Config {
         address: o.addr,
