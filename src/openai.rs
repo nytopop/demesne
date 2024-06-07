@@ -7,42 +7,104 @@ use std::{iter, mem, str};
 use async_openai::types::*;
 use constant_time_eq::constant_time_eq;
 use either::Either;
-use futures::channel::mpsc;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use futures::channel::oneshot as ones;
+use futures::channel::{mpsc, oneshot as ones};
 use futures::sink::SinkExt;
 use llama_sys::sampling::{Logit, Output};
 use llama_sys::{Context, ContextParams, Model, ModelParams, Token, Tokenizer};
 use rocket::http::Status;
-use rocket::request::FromRequest;
-use rocket::request::Outcome;
+use rocket::request::{FromRequest, Outcome};
 use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::{Json, Value};
 use rocket::serde::Serialize;
 use rocket::tokio::task::{spawn_blocking, JoinHandle};
-use rocket::{Request, Route, State};
+use rocket::{Catcher, Request, Responder, Route, State};
 
 use super::prompt::Vocab;
 use super::radix::{Radix, RadixKv};
 
+pub fn catchers() -> Vec<Catcher> {
+    #[catch(default)]
+    fn default(status: Status, _: &Request) -> (Status, Json<ApiError>) {
+        (status, Json(ApiError::new("unknown")))
+    }
+
+    catchers![default]
+}
+
+#[derive(Responder, Debug)]
+enum ErrorResp {
+    #[response(status = 400, content_type = "json")]
+    Req(Json<ApiError>),
+
+    #[response(status = 401, content_type = "json")]
+    Auth(Json<ApiError>),
+
+    #[response(status = 500, content_type = "json")]
+    Ise(Json<ApiError>),
+
+    #[response(status = 501, content_type = "json")]
+    Unimplemented(Json<ApiError>),
+}
+
 #[derive(Serialize, Default, Debug)]
 struct ApiError {
+    error: ApiErrorInner,
+}
+
+#[derive(Serialize, Default, Debug)]
+struct ApiErrorInner {
     message: Cow<'static, str>,
     r#type: Option<Cow<'static, str>>,
     param: Option<Cow<'static, str>>,
     code: Option<Cow<'static, str>>,
 }
 
-type Fails = (Status, Json<ApiError>);
+impl ApiError {
+    fn new<S: Into<Cow<'static, str>>>(message: S) -> Self {
+        let error = ApiErrorInner {
+            message: message.into(),
+            ..Default::default()
+        };
 
-// TODO: make it better
-fn fails<S: Into<Cow<'static, str>>>(status: Status, message: S) -> Fails {
-    let e = ApiError {
-        message: message.into(),
-        ..Default::default()
-    };
+        Self { error }
+    }
 
-    (status, Json(e))
+    fn message<S: Into<Cow<'static, str>>>(mut self, message: S) -> Self {
+        self.error.message = message.into();
+        self
+    }
+
+    fn r#type<S: Into<Cow<'static, str>>>(mut self, r#type: S) -> Self {
+        self.error.r#type = Some(r#type.into());
+        self
+    }
+
+    fn param<S: Into<Cow<'static, str>>>(mut self, param: S) -> Self {
+        self.error.param = Some(param.into());
+        self
+    }
+
+    fn code<S: Into<Cow<'static, str>>>(mut self, code: S) -> Self {
+        self.error.code = Some(code.into());
+        self
+    }
+
+    fn into_bad_req(self) -> ErrorResp {
+        ErrorResp::Req(Json(self))
+    }
+
+    fn into_auth(self) -> ErrorResp {
+        ErrorResp::Auth(Json(self))
+    }
+
+    fn into_ise(self) -> ErrorResp {
+        ErrorResp::Ise(Json(self))
+    }
+
+    fn into_unimplemented(self) -> ErrorResp {
+        ErrorResp::Unimplemented(Json(self))
+    }
 }
 
 struct Authorized<'r> {
@@ -51,7 +113,7 @@ struct Authorized<'r> {
 
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for Authorized<'r> {
-    type Error = Json<ApiError>;
+    type Error = ErrorResp;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let api = req.rocket().state::<Api>().unwrap();
@@ -67,11 +129,20 @@ impl<'r> FromRequest<'r> for Authorized<'r> {
             .and_then(|key| key.strip_prefix("Bearer "));
 
         let Some(key) = key else {
-            return Outcome::Error(fails(Status::Unauthorized, "malformed or missing api key"));
+            let err = ApiError::new("missing API key")
+                .r#type("invalid_request_error")
+                .into_auth();
+
+            return Outcome::Error((Status::Unauthorized, err));
         };
 
         if !constant_time_eq(key.as_bytes(), srv_key.as_bytes()) {
-            return Outcome::Error(fails(Status::Unauthorized, "malformed or missing api key"));
+            let err = ApiError::new("invalid API key")
+                .r#type("invalid_request_error")
+                .code("invalid_api_key")
+                .into_auth();
+
+            return Outcome::Error((Status::Unauthorized, err));
         }
 
         Outcome::Success(Authorized { key: Some(key) })
@@ -84,57 +155,76 @@ pub fn routes() -> Vec<Route> {
 
 #[post("/v1/chat/completions", format = "json", data = "<req>")]
 async fn chat_completions(
-    _auth: Authorized<'_>,
+    key: Result<Authorized<'_>, ErrorResp>,
     api: &State<Api>,
     req: Json<CreateChatCompletionRequest>,
-) -> Result<Either<Json<CreateChatCompletionResponse>, EventStream<UnboundedReceiver<Event>>>, Fails>
-{
+) -> Result<
+    Either<Json<CreateChatCompletionResponse>, EventStream<UnboundedReceiver<Event>>>,
+    ErrorResp,
+> {
+    let _ = key?;
     let r = req.into_inner();
 
     if r.messages.is_empty() {
-        return Err(fails(Status::BadRequest, "no messages"));
+        return Err(ApiError::new("try again with more messages.")
+            .param("messages")
+            .into_bad_req());
     }
 
     let logit_bias = r.logit_bias.into_iter().flatten().map(|(k, v)| {
         let id = k
             .parse::<u32>()
-            .map_err(|_| fails(Status::BadRequest, "invalid token in logit bias"))?;
+            .map_err(|_| ApiError::new("invalid token in logit bias"))
+            .map_err(|e| e.param("logit_bias").into_bad_req())?;
 
         let Value::Number(n) = v else {
-            return Err(fails(Status::BadRequest, "bias value is not a number"));
+            return Err(ApiError::new("bias value is not a number")
+                .param("logit_bias")
+                .into_bad_req());
         };
 
         let bias = n
             .as_f64()
-            .ok_or_else(|| fails(Status::BadRequest, "bias value"))?;
+            .ok_or_else(|| ApiError::new("bias value"))
+            .map_err(|e| e.param("logit_bias").into_bad_req())?;
 
         if !(-100. ..=100.).contains(&bias) {
-            return Err(fails(Status::BadRequest, "bias out of range"));
+            return Err(ApiError::new("bias out of range")
+                .param("logit_bias")
+                .into_bad_req());
         }
 
         Ok((id as Token, bias as f32))
     });
 
-    let logit_bias: Vec<_> = logit_bias.collect::<Result<_, Fails>>()?;
+    let logit_bias: Vec<_> = logit_bias.collect::<Result<_, ErrorResp>>()?;
 
     let logprobs = r.logprobs.unwrap_or(false);
 
     if r.top_logprobs.is_some_and(|_| !logprobs) {
-        return Err(fails(Status::BadRequest, "top_logprobs but logprobs=false"));
+        return Err(ApiError::new("top_logprobs but logprobs=false")
+            .param("top_logprobs")
+            .into_bad_req());
     }
 
     if r.top_logprobs.is_some_and(|n| n > 20) {
-        return Err(fails(Status::BadRequest, "too many logprobs"));
+        return Err(ApiError::new("too many top_logprobs")
+            .param("top_logprobs")
+            .into_bad_req());
     }
 
     let top_logprobs: usize = r.top_logprobs.unwrap_or(0).into();
 
     if r.temperature.is_some_and(|v| !(0. ..=2.).contains(&v)) {
-        return Err(fails(Status::BadRequest, "temperature out of range"));
+        return Err(ApiError::new("temperature out of range")
+            .param("temperature")
+            .into_bad_req());
     }
 
     if r.top_p.is_some_and(|v| !(0. ..=1.).contains(&v)) {
-        return Err(fails(Status::BadRequest, "top_p out of range"));
+        return Err(ApiError::new("top_p out of range")
+            .param("top_p")
+            .into_bad_req());
     }
 
     let api = api.inner();
@@ -174,7 +264,10 @@ async fn chat_completions(
             }
 
             ChatCompletionRequestMessage::Function(_) => {
-                return Err(fails(Status::NotImplemented, "unimplemented"));
+                return Err(ApiError::new("function call api is deprecated")
+                    .code("wontfix")
+                    .param("messages")
+                    .into_unimplemented());
             }
         }
     }
@@ -186,8 +279,10 @@ async fn chat_completions(
     let n_max = min(api.n_train, api.n_cells);
 
     if span.len() > n_max {
-        let msg = format!("too many prompt tokens: {} > {n_max}", span.len());
-        return Err(fails(Status::InsufficientStorage, msg));
+        return Err(ApiError::default()
+            .message(format!("too many prompt tokens: {} > {n_max}", span.len()))
+            .param("messages")
+            .into_bad_req());
     }
 
     let k = api.n_cells - span.len();
@@ -236,7 +331,8 @@ async fn chat_completions(
     Ok(match rx {
         Either::Left(recv) => Either::Left(
             recv.await
-                .map_err(|_| fails(Status::InternalServerError, "cancelled"))?,
+                .map_err(|_| ApiError::new("cancelled"))
+                .map_err(|e| e.into_ise())?,
         ),
 
         Either::Right(recv) => Either::Right(EventStream::from(recv)),
@@ -455,7 +551,7 @@ impl Inflight {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum Error {
+pub enum LoadError {
     #[error("failed to load model")]
     LoadModel,
 
@@ -484,9 +580,9 @@ impl Api {
         m: ModelParams,
         c: ContextParams,
         vocab: Vocab,
-    ) -> Result<Self, Error> {
-        let model = Model::load_from_file(path, m).ok_or(Error::LoadModel)?;
-        let mut ctx = model.context(c).ok_or(Error::LoadContext)?;
+    ) -> Result<Self, LoadError> {
+        let model = Model::load_from_file(path, m).ok_or(LoadError::LoadModel)?;
+        let mut ctx = model.context(c).ok_or(LoadError::LoadContext)?;
         let tk = model.tokenizer();
 
         let (queue, rx) = mpsc::channel(32);
@@ -527,12 +623,13 @@ impl Api {
     }
 
     /// Schedule an inflight completion req.
-    async fn schedule(&self, params: Inflight) -> Result<JoinHandle<()>, Fails> {
+    async fn schedule(&self, params: Inflight) -> Result<JoinHandle<()>, ErrorResp> {
         let mut jobs = self.queue.clone();
 
         jobs.send(params)
             .await
-            .map_err(|_| fails(Status::InternalServerError, "failed to schedule span"))?;
+            .map_err(|_| ApiError::new("failed to schedule span"))
+            .map_err(|e| e.into_ise())?;
 
         let inner = self.inner.clone();
 
@@ -549,7 +646,7 @@ struct Inner {
 }
 
 impl Inner {
-    fn flush_all(mu: Arc<Mutex<Self>>) -> Result<(), Error> {
+    fn flush_all(mu: Arc<Mutex<Self>>) -> Result<(), llama_sys::Error> {
         while !{
             let mut ex = mu.lock().unwrap();
             ex.flush_bounded()?;
@@ -561,7 +658,7 @@ impl Inner {
 
     // TODO: use tracing to record performance data
 
-    fn flush_bounded(&mut self) -> Result<(), Error> {
+    fn flush_bounded(&mut self) -> Result<(), llama_sys::Error> {
         // move any new requests to the back of scheduled queue
         while let Ok(Some(p)) = self.queue.try_next() {
             self.sched.push(p);
