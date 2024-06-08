@@ -118,8 +118,15 @@ async fn main() -> Result<(), rocket::Error> {
         ..Default::default()
     };
 
+    let api = openai::ApiBuilder::new(o.model_path, o.vocab)
+        .model_params(m)
+        .context_params(c)
+        .api_key(o.api_key)
+        .build()
+        .unwrap();
+
     rocket::custom(config)
-        .manage(openai::Api::load(o.api_key, o.model_path, m, c, o.vocab).unwrap())
+        .manage(api)
         .mount("/", openai::routes())
         .register("/", openai::catchers())
         .launch()

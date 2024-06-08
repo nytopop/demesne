@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cmp::min;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{iter, mem, str};
 
@@ -628,26 +628,45 @@ pub enum LoadError {
     Llama(#[from] llama_sys::Error),
 }
 
-pub struct Api {
-    queue: mpsc::Sender<Inflight>,
-    inner: Arc<Mutex<Inner>>,
-    tk: Tokenizer,
-    n_train: usize,
-    n_cells: usize,
-    api_key: Option<String>,
+pub struct ApiBuilder {
+    path: PathBuf,
     vocab: Vocab,
+    m_param: Option<ModelParams>,
+    c_param: Option<ContextParams>,
+    api_key: Option<String>,
 }
 
-impl Api {
-    /// Load a gguf model from the filesystem.
-    pub fn load<P: AsRef<Path>>(
-        api_key: Option<String>,
-        path: P,
-        m: ModelParams,
-        c: ContextParams,
-        vocab: Vocab,
-    ) -> Result<Self, LoadError> {
-        let model = Model::load_from_file(path, m).ok_or(LoadError::LoadModel)?;
+impl ApiBuilder {
+    pub fn new<P: Into<PathBuf>>(path: P, vocab: Vocab) -> Self {
+        Self {
+            path: path.into(),
+            m_param: None,
+            c_param: None,
+            vocab,
+            api_key: None,
+        }
+    }
+
+    pub fn model_params(mut self, m: ModelParams) -> Self {
+        self.m_param = Some(m);
+        self
+    }
+
+    pub fn context_params(mut self, c: ContextParams) -> Self {
+        self.c_param = Some(c);
+        self
+    }
+
+    pub fn api_key(mut self, key: Option<String>) -> Self {
+        self.api_key = key;
+        self
+    }
+
+    pub fn build(self) -> Result<Api, LoadError> {
+        let m = self.m_param.unwrap_or_default();
+        let model = Model::load_from_file(self.path, m).ok_or(LoadError::LoadModel)?;
+
+        let c = self.c_param.unwrap_or_default();
         let mut ctx = model.context(c).ok_or(LoadError::LoadContext)?;
         let tk = model.tokenizer();
 
@@ -665,17 +684,29 @@ impl Api {
             cache: RadixKv::new(root),
         }));
 
-        Ok(Self {
+        Ok(Api {
             queue,
             inner,
             tk,
             n_train,
             n_cells,
-            api_key,
-            vocab,
+            api_key: self.api_key,
+            vocab: self.vocab,
         })
     }
+}
 
+pub struct Api {
+    queue: mpsc::Sender<Inflight>,
+    inner: Arc<Mutex<Inner>>,
+    tk: Tokenizer,
+    n_train: usize,
+    n_cells: usize,
+    api_key: Option<String>,
+    vocab: Vocab,
+}
+
+impl Api {
     /// Feed a closed header into buf.
     fn feed(&self, buf: &mut Vec<Token>, h: [&str; 2], text: &str) {
         self.tk.tokenize(buf, h[0], true);
