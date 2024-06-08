@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use llama_sys::{ContextParams, ModelParams};
+use llama_sys::{sys, ContextParams, ModelParams};
 use structopt::StructOpt;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::Format;
@@ -40,6 +40,17 @@ struct Opts {
     #[structopt(short = "l", long = "layers", name = "layers", default_value = "-1")]
     n_gpu_layers: isize,
 
+    /// how to split compute amongst gpus
+    #[structopt(short = "s", long = "split-mode", name = "mode", default_value = "row")]
+    split_mode: sys::llama_split_mode,
+
+    #[structopt(short = "g", long = "main-gpu", name = "gpu", default_value = "0")]
+    main_gpu: usize,
+
+    /// proportion of the model (layers or rows) to offload to each gpu (pass N times)
+    #[structopt(short = "t", long = "tensor-split", name = "split")]
+    tensor_split: Option<Vec<f32>>,
+
     /// use flash attention
     #[structopt(short = "f", long = "flash-attn")]
     flash_attn: bool,
@@ -76,14 +87,20 @@ async fn main() -> Result<(), rocket::Error> {
             .get_matches(),
     );
 
-    let m = ModelParams::default()
+    let mut m = ModelParams::default()
         .n_gpu_layers(if o.n_gpu_layers < 0 {
             32768
         } else {
             o.n_gpu_layers as usize
         })
         .use_mmap(o.mmap)
-        .check_tensors(true);
+        .check_tensors(true)
+        .split_mode(o.split_mode)
+        .main_gpu(o.main_gpu);
+
+    if let Some(tensor_split) = o.tensor_split {
+        m = m.tensor_split(tensor_split);
+    }
 
     let n_cpu = num_cpus::get_physical();
 

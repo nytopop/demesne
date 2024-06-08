@@ -8,6 +8,20 @@ use std::sync::{Arc, Once};
 #[allow(rustdoc::bare_urls)]
 pub mod sys {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+    impl std::str::FromStr for llama_split_mode {
+        type Err = &'static str;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "none" => Ok(llama_split_mode::LLAMA_SPLIT_MODE_NONE),
+                "layer" => Ok(llama_split_mode::LLAMA_SPLIT_MODE_LAYER),
+                "row" => Ok(llama_split_mode::LLAMA_SPLIT_MODE_ROW),
+
+                _ => Err("expected 'none' | 'layer' | 'row'"),
+            }
+        }
+    }
 }
 
 pub use sys::{
@@ -30,6 +44,10 @@ pub unsafe fn disable_logging() {
     extern "C" fn noop(_level: sys::ggml_log_level, _text: *const i8, _user_data: *mut c_void) {}
 
     sys::llama_log_set(Some(noop), ptr::null_mut());
+}
+
+pub fn max_devices() -> usize {
+    unsafe { sys::llama_max_devices() }
 }
 
 unsafe impl Sync for ContextParams {}
@@ -238,9 +256,18 @@ impl ModelParams {
         self
     }
 
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn tensor_split(mut self, tensor_split: *const f32) -> Self {
-        self.tensor_split = tensor_split;
+    pub fn tensor_split(mut self, mut tensor_split: Vec<f32>) -> Self {
+        let n = max_devices();
+        assert!(tensor_split.len() <= n);
+
+        if tensor_split.len() < n {
+            tensor_split.resize(n, 0.);
+        }
+
+        let b = tensor_split.into_boxed_slice();
+        let b = Box::leak::<'static>(b);
+
+        self.tensor_split = b.as_ptr();
         self
     }
 
