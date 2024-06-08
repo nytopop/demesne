@@ -762,26 +762,8 @@ impl Inner {
         }
 
         // compute how much kv space may be allocated to each scheduled span
-        let mut plan = Radix::new();
-        let mut left = self.ctx.kv_cache_n_cells();
-        let mut k = 0; // # of params that fit
-
-        'outer: for p in self.sched.iter() {
-            for span in p.enabled() {
-                let a = plan.ancestor(span);
-                let n = span.len() - a.n;
-
-                if n > left {
-                    break 'outer;
-                }
-
-                left -= n;
-                plan.insert(a, span);
-            }
-
-            k += 1;
-        }
-
+        let max = self.ctx.kv_cache_n_cells();
+        let k = n_dedup_reqs_within(max, &self.sched);
         let sched = &mut self.sched[..k];
 
         // at this point, we know all spans in sched will pack into available kv
@@ -861,6 +843,29 @@ impl Inner {
 
         Ok(())
     }
+}
+
+fn n_dedup_reqs_within(mut left: usize, sched: &[Inflight]) -> usize {
+    let mut plan = Radix::new();
+    let mut k = 0; // # of reqs that fit
+
+    'outer: for p in sched {
+        for span in p.enabled() {
+            let a = plan.ancestor(span);
+            let n = span.len() - a.n;
+
+            if n > left {
+                break 'outer;
+            }
+
+            left -= n;
+            plan.insert(a, span);
+        }
+
+        k += 1;
+    }
+
+    k
 }
 
 fn clamp_sum<'a, T, F: Fn(&'a T) -> usize>(mut left: usize, upper: &'a [T], cost: F) -> Vec<usize> {
