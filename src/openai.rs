@@ -166,7 +166,7 @@ async fn chat_completions(
     let r = req.into_inner();
 
     if r.messages.is_empty() {
-        return Err(ApiError::new("try again with more messages.")
+        return Err(ApiError::new("try again with more messages")
             .param("messages")
             .into_bad_req());
     }
@@ -225,6 +225,23 @@ async fn chat_completions(
         return Err(ApiError::new("top_p out of range")
             .param("top_p")
             .into_bad_req());
+    }
+
+    if let Some(stop) = r.stop.as_ref() {
+        if match stop {
+            Stop::String(s) => s.is_empty(),
+            Stop::StringArray(xs) => xs.iter().any(|s| s.is_empty()),
+        } {
+            return Err(ApiError::new("stop strings must be non-empty")
+                .param("stop")
+                .into_bad_req());
+        }
+
+        if matches!(stop, Stop::StringArray(xs) if xs.len() > 4) {
+            return Err(ApiError::new("too many stop strings (max 4)")
+                .param("stop")
+                .into_bad_req());
+        }
     }
 
     let api = api.inner();
@@ -300,12 +317,22 @@ async fn chat_completions(
         (Either::Left(Some(tx)), Either::Left(rx), false)
     };
 
+    let stop_matches = r.stop.into_iter().flat_map(|s| match s {
+        Stop::String(s) => vec![StopAutomaton::new(s.into_bytes())],
+
+        Stop::StringArray(xs) => xs
+            .into_iter()
+            .map(|s| StopAutomaton::new(s.into_bytes()))
+            .collect(),
+    });
+
     let mut p = Inflight {
         temperature: r.temperature.unwrap_or(1.),
         min_s: 1. - r.top_p.unwrap_or(1.),
         logit_bias,
         logprobs,
         top_logprobs,
+        stream_usage,
 
         n_infill: span.len(),
         n_infer,
@@ -317,8 +344,9 @@ async fn chat_completions(
         dirty: vec![false; n],
         first: vec![true; n],
 
-        stream_usage,
+        stop_matches: vec![stop_matches.collect(); n],
         finish: vec![(n_infer == 0).then_some(FinishReason::Length); n],
+
         tx,
     };
 
@@ -345,6 +373,7 @@ struct Inflight {
     logit_bias: Vec<(Token, f32)>,
     logprobs: bool,
     top_logprobs: usize,
+    stream_usage: bool,
 
     n_infill: usize, // how much of span is infill?
     n_infer: usize,  // max tokens to infer
@@ -356,9 +385,9 @@ struct Inflight {
     prob: Vec<Vec<ChatCompletionTokenLogprob>>,
     dirty: Vec<bool>,
     first: Vec<bool>,
-
-    stream_usage: bool,
+    stop_matches: Vec<Vec<StopAutomaton>>,
     finish: Vec<Option<FinishReason>>,
+
     tx: Either<Option<ones::Sender<Json<CreateChatCompletionResponse>>>, UnboundedSender<Event>>,
 }
 
@@ -392,8 +421,25 @@ impl Inflight {
             .distribution()
             .sample();
 
+        let nb = ctx.detokenize(&mut self.text[i], tok, false);
+        let n = self.text[i].len();
+
+        if ctx.model().token_is_eog(tok) {
+            self.finish[i] = Some(FinishReason::Stop);
+        } else if self.span[i].len() - self.n_infill >= self.n_infer {
+            self.finish[i] = Some(FinishReason::Length);
+        } else if nb > 0
+            && self.stop_matches[i]
+                .iter_mut()
+                .any(|a| a.feed_done(&self.text[i][n - nb..]))
+        {
+            // do not add this token to the response
+            self.finish[i] = Some(FinishReason::Stop);
+            self.text[i].truncate(n - nb);
+            return;
+        }
+
         self.span[i].push(tok);
-        ctx.detokenize(&mut self.text[i], tok, false);
         self.dirty[i] = true;
 
         // finish computing logprobs now that we know which token was sampled
@@ -421,14 +467,6 @@ impl Inflight {
             };
 
             self.prob[i].push(tlp);
-        }
-
-        // TODO: stop sequences
-
-        if ctx.model().token_is_eog(tok) {
-            self.finish[i] = Some(FinishReason::Stop);
-        } else if self.span[i].len() - self.n_infill >= self.n_infer {
-            self.finish[i] = Some(FinishReason::Length);
         }
     }
 
@@ -547,6 +585,34 @@ impl Inflight {
 
             total_tokens: self.n_actual as u32,
         }
+    }
+}
+
+#[derive(Clone)]
+struct StopAutomaton {
+    pat: Vec<u8>,
+    pre: Vec<u8>,
+}
+
+impl StopAutomaton {
+    fn new(pat: Vec<u8>) -> Self {
+        Self { pat, pre: vec![] }
+    }
+
+    fn feed_done(&mut self, span: &[u8]) -> bool {
+        for &c in span {
+            if c == self.pat[self.pre.len()] {
+                self.pre.push(c);
+            } else {
+                self.pre.clear();
+            }
+
+            if self.pat.len() == self.pre.len() {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
