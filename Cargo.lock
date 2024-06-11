@@ -46,8 +46,8 @@ dependencies = [
 
 [[package]]
 name = "async-openai"
-version = "0.23.0"
-source = "git+https://github.com/nytopop/async-openai?branch=fixes#8a33c70e8c1b445167a1c2ce493f0d21539f1195"
+version = "0.23.1"
+source = "git+https://github.com/nytopop/async-openai?branch=fixes#b0ff5c2de6e0dc31ef940f444eb194c19197a808"
 dependencies = [
  "async-convert",
  "backoff",
