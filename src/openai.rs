@@ -768,9 +768,10 @@ impl Inner {
         // compute how much kv space may be allocated to each scheduled span
         let max = self.ctx.kv_cache_n_cells();
         let k = n_dedup_reqs_within(max, &self.sched);
+
+        // slice to get span of spans that pack into available kv
         let sched = &mut self.sched[..k];
 
-        // at this point, we know all spans in sched will pack into available kv
         let bounds: Vec<_> = sched
             .iter()
             .flat_map(|p| p.enabled())
