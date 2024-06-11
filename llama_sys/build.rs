@@ -23,6 +23,9 @@ fn main() {
 
     println!("cargo:rustc-link-lib=dylib=gomp");
 
+    #[cfg(feature = "force_mmq")]
+    conf.define("LLAMA_CUDA_FORCE_MMQ", "ON");
+
     // rocm (amdgpu)
     #[cfg(feature = "rocm")]
     {

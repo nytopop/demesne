@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 rocm = []
 cuda = []
+force_mmq = []
 
 [build-dependencies]
 cmake = "0.1.50"

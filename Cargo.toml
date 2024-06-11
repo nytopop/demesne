@@ -12,6 +12,7 @@ publish = false
 [features]
 rocm = ["llama_sys/rocm"]
 cuda = ["llama_sys/cuda"]
+force_mmq = ["llama_sys/force_mmq"]
 
 [dependencies]
 llama_sys = { path = "llama_sys" }
