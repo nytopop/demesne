@@ -820,9 +820,11 @@ impl Inner {
 
         for (i, p) in sched.iter_mut().enumerate() {
             let mut touched = false;
+            let mut n_ready = 0;
 
             for j in 0..p.span.len() {
                 if p.finish[j].is_some() {
+                    n_ready += 1;
                     continue;
                 }
 
@@ -843,7 +845,7 @@ impl Inner {
                 touched = true;
             }
 
-            if touched && p.accept_and_complete() {
+            if (touched && p.accept_and_complete()) || n_ready == p.span.len() {
                 gc.push(i);
             }
         }
