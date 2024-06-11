@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{iter, mem, str};
 
 use async_openai::types::*;
@@ -347,6 +348,10 @@ async fn chat_completions(
         stop_matches: vec![stop_matches.collect(); n],
         finish: vec![(n_infer == 0).then_some(FinishReason::Length); n],
 
+        created: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap(),
         tx,
     };
 
@@ -388,6 +393,7 @@ struct Inflight {
     stop_matches: Vec<Vec<StopAutomaton>>,
     finish: Vec<Option<FinishReason>>,
 
+    created: u32,
     tx: Either<Option<ones::Sender<Json<CreateChatCompletionResponse>>>, UnboundedSender<Event>>,
 }
 
@@ -505,7 +511,7 @@ impl Inflight {
             let resp = CreateChatCompletionResponse {
                 id: "id".to_owned(),
                 choices,
-                created: 0,
+                created: self.created,
                 model: "model".to_owned(),
                 system_fingerprint: None,
                 object: "chat.completion".to_owned(),
@@ -544,7 +550,7 @@ impl Inflight {
             let mut resp = CreateChatCompletionStreamResponse {
                 id: "".to_owned(),
                 choices: choices.collect(),
-                created: 0,
+                created: self.created,
                 model: "".to_owned(),
                 system_fingerprint: None,
                 object: "chat.completion.chunk".to_owned(),
