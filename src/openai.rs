@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cmp::min;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::{iter, mem, str};
 
@@ -761,6 +761,10 @@ impl Inner {
             self.sched.push(p);
         }
 
+        if self.sched.is_empty() {
+            return Ok(());
+        }
+
         // compute how much kv space may be allocated to each scheduled span
         let max = self.ctx.kv_cache_n_cells();
         let k = n_dedup_reqs_within(max, &self.sched);
@@ -803,15 +807,20 @@ impl Inner {
 
         // decode w/e spans are marked as cold
         let batch = self.cache.pending_batch();
-        let evals = self.ctx.decode(&batch)?;
 
-        self.cache
-            .accept_batch(evals.into_iter().map(|o| o.unwrap()));
+        if !batch.is_empty() {
+            let evals = self.ctx.decode(&batch)?;
+
+            self.cache
+                .accept_batch(evals.into_iter().map(|o| o.unwrap()));
+        }
 
         // dispatch logits to any running spans that are fully infilled
         let mut gc = vec![];
 
         for (i, p) in sched.iter_mut().enumerate() {
+            let mut touched = false;
+
             for j in 0..p.span.len() {
                 if p.finish[j].is_some() {
                     continue;
@@ -830,9 +839,11 @@ impl Inner {
 
                 let logits = self.cache[a.i].logits[a.k - 1].clone();
                 p.accept(&self.ctx, logits, j);
+
+                touched = true;
             }
 
-            if p.accept_and_complete() {
+            if touched && p.accept_and_complete() {
                 gc.push(i);
             }
         }
