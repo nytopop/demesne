@@ -1,11 +1,11 @@
-use std::collections::{HashSet, VecDeque};
+use std::cmp::{max, min};
+use std::collections::{HashMap, VecDeque};
 use std::iter;
 use std::ops::{Index, IndexMut};
 
 use llama_sys::sampling::{Logit, Output};
 use llama_sys::{Context, EvalReq, SeqId, Token};
 use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableDiGraph};
-use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 
 fn common_prefix<T: Eq>(a: &[T], b: &[T]) -> usize {
@@ -54,25 +54,17 @@ impl RadixKv {
         Self { g, root }
     }
 
-    pub fn ancestor(&self, tokens: &[Token]) -> Ancestor {
-        self.ancestry(tokens, |_| ())
-    }
-
-    pub fn ancestry<F, T>(&self, mut tokens: &[Token], mut visit: F) -> Ancestor
-    where
-        F: FnMut(NodeIndex) -> T,
-    {
+    pub fn ancestor(&self, mut tokens: &[Token]) -> Ancestor {
         let mut a = Ancestor {
             i: self.root,
             n: 0,
-            k: common_prefix(&self.g[self.root].tokens, tokens),
+            k: common_prefix(&self[self.root].tokens, tokens),
         };
 
         loop {
-            visit(a.i);
             a.n += a.k;
 
-            if a.k != self.g[a.i].tokens.len() {
+            if a.k != self[a.i].tokens.len() {
                 break a;
             }
 
@@ -81,7 +73,7 @@ impl RadixKv {
             if let Some((j, p)) = self
                 .g
                 .neighbors(a.i)
-                .map(|j| (j, common_prefix(&self.g[j].tokens, tokens)))
+                .map(|j| (j, common_prefix(&self[j].tokens, tokens)))
                 .filter(|(_, p)| *p > 0) // NOTE: for reasons
                 .max_by_key(|(_, p)| *p)
             {
@@ -99,16 +91,16 @@ impl RadixKv {
             return None;
         }
 
-        assert!(a.k <= self.g[a.i].tokens.len());
+        assert!(a.k <= self[a.i].tokens.len());
 
-        if a.k < self.g[a.i].tokens.len() {
-            self.split_off(a.i, a.k);
+        if a.k < self[a.i].tokens.len() {
+            self.split_off(ctx, a.i, a.k);
         }
 
-        assert!(a.k == self.g[a.i].tokens.len());
+        assert!(a.k == self[a.i].tokens.len());
 
         if self.g.neighbors(a.i).next().is_some() {
-            let node = &self.g[a.i];
+            let node = &self[a.i];
 
             let tag = ctx.kv_cache_unique_id();
             ctx.kv_cache_seq_cp(node.tag, tag, -1, a.n as i32);
@@ -125,26 +117,34 @@ impl RadixKv {
 
             Some(j)
         } else {
-            let node = &mut self.g[a.i];
+            let node = &mut self[a.i];
             node.tokens.extend_from_slice(&span[a.n..]);
+
             Some(a.i)
         }
     }
 
-    fn split_off(&mut self, src: NodeIndex, at: usize) -> (EdgeIndex, NodeIndex) {
-        let node = &mut self.g[src];
+    fn split_off(&mut self, cx: &mut Context, src: NodeIndex, at: usize) -> (EdgeIndex, NodeIndex) {
+        let node = &mut self[src];
 
         let tokens = node.tokens.split_off(at);
-        let logits = node.logits.split_off(at);
+
+        let logits = (at <= node.logits.len())
+            .then(|| node.logits.split_off(at))
+            .unwrap_or_default();
 
         assert!(!tokens.is_empty());
 
         let next = Span {
-            tag: node.tag,
+            tag: cx.kv_cache_unique_id(),
             offset: node.offset + node.tokens.len(),
             tokens,
             logits,
         };
+
+        let o = next.offset + next.tokens.len();
+        cx.kv_cache_seq_cp(node.tag, next.tag, -1, o as i32);
+        cx.kv_cache_seq_rm(node.tag, next.offset as i32, -1);
 
         let dst = self.g.add_node(next);
 
@@ -159,79 +159,82 @@ impl RadixKv {
     }
 
     pub fn prune<'a, I: IntoIterator<Item = &'a [Token]>>(&mut self, ctx: &mut Context, skips: I) {
-        // get sizeof cache
+        let size = self.size();
+        let max_size = ctx.kv_cache_n_cells();
+
+        if size <= max_size {
+            return;
+        }
+
+        // find nodes along each skip, and how much we can prune from each node
+        let mut tips: HashMap<_, usize> = HashMap::new();
+
+        for span in skips {
+            let a = self.ancestor(span);
+
+            tips.entry(a.i)
+                .and_modify(|k| *k = max(a.k, *k))
+                .or_insert(a.k);
+        }
+
+        // get to deleting spans in reverse bfs order until left == 0
+        let mut left = size - max_size;
+
+        'outer: loop {
+            for i in self.g.externals(Direction::Outgoing).collect::<Vec<_>>() {
+                if left == 0 {
+                    break 'outer;
+                }
+
+                let node = &mut self[i];
+
+                // # of cells total
+                let n = node.tokens.len();
+
+                // starting offset of pruned range
+                let k = tips.get(&i).copied().unwrap_or(0);
+
+                if n == k {
+                    continue;
+                }
+
+                // # of cells available to prune
+                let p = n - k;
+
+                // # of cells we're actually gonna prune
+                let q = min(p, left);
+
+                node.tokens.truncate(n - q);
+                node.logits.truncate(n - q);
+
+                if node.tokens.is_empty() {
+                    ctx.kv_cache_seq_rm(node.tag, -1, -1);
+
+                    if i != self.root {
+                        self.g.remove_node(i).unwrap();
+                    }
+                } else {
+                    ctx.kv_cache_seq_rm(node.tag, (node.offset + k + (p - q)) as i32, -1);
+                }
+
+                left -= q;
+            }
+        }
+
+        ctx.kv_cache_defrag();
+    }
+
+    fn size(&self) -> usize {
         let mut size = 0;
         let mut fifo = VecDeque::new();
         fifo.push_back(self.root);
 
         while let Some(i) = fifo.pop_front() {
-            size += self.g[i].tokens.len();
+            size += self[i].tokens.len();
             fifo.extend(self.g.neighbors(i));
         }
 
-        let mut max = ctx.kv_cache_n_cells();
-
-        if size < max {
-            return;
-        }
-
-        // free more than we need to amortize the cost of defrags a bit
-        let k = ctx.n_batch() as usize * 3;
-        max = max.saturating_sub(k);
-
-        // find indices along each skip
-        let mut path = HashSet::new();
-
-        for span in skips {
-            self.ancestry(span, |i| path.insert(i));
-        }
-
-        // get to deleting spans in reverse bfs order until left == 0
-        let mut left = size - max;
-        fifo.extend(self.g.externals(Direction::Outgoing));
-
-        while let Some(i) = fifo.pop_front() {
-            if left == 0 {
-                break;
-            }
-
-            if path.contains(&i) || !self.g.contains_node(i) {
-                continue;
-            }
-
-            let n = self.g[i].tokens.len();
-
-            if n > left {
-                let node = &mut self.g[i];
-                let k = n - left;
-
-                ctx.kv_cache_seq_rm(node.tag, (node.offset + k) as i32, -1);
-                node.tokens.truncate(k);
-                node.logits.truncate(k);
-                break;
-            }
-
-            let mut it = self
-                .g
-                .edges_directed(i, Direction::Incoming)
-                .map(|e| e.source());
-
-            fifo.extend(it.clone());
-
-            let node = &self.g[i];
-
-            if it.any(|j| self.g[j].tag == node.tag) {
-                ctx.kv_cache_seq_rm(node.tag, node.offset as i32, -1);
-            } else {
-                ctx.kv_cache_seq_rm(node.tag, -1, -1);
-            }
-
-            self.g.remove_node(i).unwrap();
-
-            left -= n;
-        }
-
-        ctx.kv_cache_defrag();
+        size
     }
 
     pub fn pending_batch(&self) -> Vec<EvalReq> {
@@ -244,7 +247,7 @@ impl RadixKv {
             tags.sort();
             tags.dedup();
 
-            let node = &self.g[i];
+            let node = &self[i];
 
             if node.logits.len() < node.tokens.len() {
                 let it = node
@@ -269,7 +272,7 @@ impl RadixKv {
         fifo.push_back(i);
 
         while let Some(i) = fifo.pop_front() {
-            tags.push(self.g[i].tag);
+            tags.push(self[i].tag);
             fifo.extend(self.g.neighbors(i));
         }
 
@@ -283,7 +286,7 @@ impl RadixKv {
 
         // assumption: it's in the same order as when we scheduled pending_batch
         while let Some(i) = fifo.pop_front() {
-            let node = &mut self.g[i];
+            let node = &mut self[i];
 
             if node.logits.len() < node.tokens.len() {
                 let n = node.tokens.len() - node.logits.len();
@@ -317,9 +320,11 @@ impl Radix {
     }
 
     pub fn ancestor(&mut self, mut span: &[Token]) -> Ancestor {
-        let mut a = Ancestor { i: self.root, n: 0, k: 0 };
-
-        a.k = common_prefix(&self.g[a.i], span);
+        let mut a = Ancestor {
+            i: self.root,
+            n: 0,
+            k: common_prefix(&self.g[self.root], span),
+        };
 
         loop {
             a.n += a.k;
@@ -334,6 +339,7 @@ impl Radix {
                 .g
                 .neighbors(a.i)
                 .map(|j| (j, common_prefix(&self.g[j], span)))
+                .filter(|(_, p)| *p > 0) // NOTE: for reasons
                 .max_by_key(|(_, p)| *p)
             {
                 a.i = j;
