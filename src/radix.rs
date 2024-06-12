@@ -186,7 +186,7 @@ impl RadixKv {
                     break 'outer;
                 }
 
-                let node = &mut self[i];
+                let node = &mut self.g[i];
 
                 // # of cells total
                 let n = node.tokens.len();
@@ -207,12 +207,9 @@ impl RadixKv {
                 node.tokens.truncate(n - q);
                 node.logits.truncate(n - q);
 
-                if node.tokens.is_empty() {
+                if node.tokens.is_empty() && i != self.root {
                     ctx.kv_cache_seq_rm(node.tag, -1, -1);
-
-                    if i != self.root {
-                        self.g.remove_node(i).unwrap();
-                    }
+                    self.g.remove_node(i).unwrap();
                 } else {
                     ctx.kv_cache_seq_rm(node.tag, (node.offset + k + (p - q)) as i32, -1);
                 }
