@@ -10,9 +10,15 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [features]
-rocm = ["llama_sys/rocm"]
+sve = ["llama_sys/sve"]
+cpu_hbm = ["llama_sys/cpu_hbm"]
 cuda = ["llama_sys/cuda"]
-force_mmq = ["llama_sys/force_mmq"]
+cuda_force_mmq = ["llama_sys/cuda_force_mmq"]
+rocm = ["llama_sys/rocm"]
+rocm_uma = ["llama_sys/rocm_uma"]
+vulkan = ["llama_sys/vulkan"]
+metal = ["llama_sys/metal"]
+kompute = ["llama_sys/kompute"]
 
 [dependencies]
 llama_sys = { path = "llama_sys" }

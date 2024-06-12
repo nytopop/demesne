@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-rocm = []
+sve = []
+cpu_hbm = []
 cuda = []
-force_mmq = []
+cuda_force_mmq = []
+rocm = []
+rocm_uma = []
+vulkan = []
+metal = []
+kompute = []
 
 [build-dependencies]
 cmake = "0.1.50"
