@@ -19,6 +19,8 @@ fn main() {
     // cpu features
     let on = |x| if x { "ON" } else { "OFF" };
 
+    // TODO: libcurl
+
     conf.define("LLAMA_SVE", on(cfg!(feature = "sve")))
         .define("LLAMA_AVX", on(cfg!(target_feature = "avx")))
         .define("LLAMA_AVX2", on(cfg!(target_feature = "avx2")))
@@ -29,6 +31,9 @@ fn main() {
         .define("LLAMA_FMA", on(cfg!(target_feature = "fma")))
         .define("LLAMA_F16C", on(cfg!(target_feature = "f16c")))
         // backend stuff
+        .define("LLAMA_ACCELERATE", on(cfg!(feature = "accelerate")))
+        .define("LLAMA_BLAS", on(cfg!(feature = "blas")))
+        .define("LLAMA_LLAMAFILE", on(cfg!(feature = "sgemm")))
         .define("LLAMA_CPU_HBM", on(cfg!(feature = "cpu_hbm")))
         .define("LLAMA_CUDA_FORCE_MMQ", on(cfg!(feature = "cuda_force_mmq")))
         .define("LLAMA_CUDA", on(cfg!(feature = "cuda")))
