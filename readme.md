@@ -19,7 +19,7 @@ Godspeed.
 # status & feature set
 Not ready for prod use. Needs polish & lots of stuff is as yet unimplemented
 
-- [ ] broad accelerator support inherited from llama.cpp (nvidia, amd, metal, partial offload, etc)
+- [x] broad accelerator support inherited from llama.cpp (nvidia, amd, metal, partial offload, etc)
 
 - [ ] openai chat api compatibility
 
