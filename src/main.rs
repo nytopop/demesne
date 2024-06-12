@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use llama_sys::{sys, ContextParams, ModelParams};
 use structopt::StructOpt;
@@ -13,15 +14,15 @@ mod openai;
 mod prompt;
 mod radix;
 
-#[derive(Debug, StructOpt)]
+#[derive(StructOpt)]
 #[structopt(name = "demesne")]
 struct Opts {
     /// listen address
-    #[structopt(short = "a", long = "addr", name = "addr", default_value = "0.0.0.0")]
+    #[structopt(long = "addr", name = "addr", default_value = "0.0.0.0")]
     addr: IpAddr,
 
     /// listen port
-    #[structopt(short = "p", long = "port", name = "port", default_value = "9090")]
+    #[structopt(long = "port", name = "port", default_value = "9090")]
     port: u16,
 
     /// path to some gguf model
@@ -44,6 +45,7 @@ struct Opts {
     #[structopt(short = "s", long = "split-mode", name = "mode", default_value = "row")]
     split_mode: sys::llama_split_mode,
 
+    /// index of the primary gpu
     #[structopt(short = "g", long = "main-gpu", name = "gpu", default_value = "0")]
     main_gpu: usize,
 
@@ -55,6 +57,10 @@ struct Opts {
     #[structopt(short = "f", long = "flash-attn")]
     flash_attn: bool,
 
+    /// quantization to use for kv cache (q4 | q8 | f16)
+    #[structopt(short = "q", long = "quant-kv", name = "quant", default_value = "f16")]
+    quant_kv: Quant,
+
     /// memory map the loaded model (not very useful if offloaded)
     #[structopt(long = "mmap")]
     mmap: bool,
@@ -63,9 +69,24 @@ struct Opts {
     #[structopt(short = "k", long = "api-key", name = "api-key")]
     api_key: Option<String>,
 
-    /// override vocab kind (mis3 | l3 | phi3 | cml)
-    #[structopt(short = "v", long = "vocab", name = "vocab", default_value = "cml")]
-    vocab: prompt::Vocab,
+    /// override prompt template (mis3 | l3 | phi3 | cml)
+    #[structopt(short = "p", long = "prompt", name = "template", default_value = "cml")]
+    prompt: prompt::Vocab,
+}
+
+struct Quant(sys::ggml_type);
+
+impl FromStr for Quant {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "q4" => Ok(Self(sys::ggml_type_GGML_TYPE_Q4_0)),
+            "q8" => Ok(Self(sys::ggml_type_GGML_TYPE_Q8_0)),
+            "f16" => Ok(Self(sys::ggml_type_GGML_TYPE_F16)),
+            _ => Err("expected 'q4' | 'q8' | 'f16'"),
+        }
+    }
 }
 
 #[rocket::main]
@@ -110,7 +131,9 @@ async fn main() -> Result<(), rocket::Error> {
         .n_ubatch(o.n_batch)
         .n_threads(n_cpu)
         .n_threads_batch(n_cpu)
-        .flash_attn(o.flash_attn);
+        .flash_attn(o.flash_attn)
+        .type_k(o.quant_kv.0)
+        .type_v(o.quant_kv.0);
 
     let config = rocket::Config {
         address: o.addr,
@@ -118,7 +141,7 @@ async fn main() -> Result<(), rocket::Error> {
         ..Default::default()
     };
 
-    let api = openai::ApiBuilder::new(o.model_path, o.vocab)
+    let api = openai::ApiBuilder::new(o.model_path, o.prompt)
         .model_params(m)
         .context_params(c)
         .api_key(o.api_key)
