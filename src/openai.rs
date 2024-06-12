@@ -20,6 +20,7 @@ use rocket::serde::json::{Json, Value};
 use rocket::serde::Serialize;
 use rocket::tokio::task::{spawn_blocking, JoinHandle};
 use rocket::{Catcher, Request, Responder, Route, State};
+use uuid::Uuid;
 
 use super::prompt::Vocab;
 use super::radix::{Radix, RadixKv};
@@ -109,6 +110,7 @@ impl ApiError {
 }
 
 struct Authorized<'r> {
+    #[allow(dead_code)]
     key: Option<&'r str>,
 }
 
@@ -328,6 +330,7 @@ async fn chat_completions(
     });
 
     let mut p = Inflight {
+        id: Uuid::new_v4(),
         temperature: r.temperature.unwrap_or(1.),
         min_s: 1. - r.top_p.unwrap_or(1.),
         logit_bias,
@@ -373,6 +376,7 @@ async fn chat_completions(
 }
 
 struct Inflight {
+    id: Uuid,
     temperature: f32, // softmax temperature
     min_s: f32,       // min ratio of probability steps
     logit_bias: Vec<(Token, f32)>,
@@ -507,9 +511,9 @@ impl Inflight {
             let choices = choices.collect();
             drop(logprobs);
 
-            // TODO: id, timestamp, model, fingerprint
+            // TODO: model, system_fingerprint
             let resp = CreateChatCompletionResponse {
-                id: "id".to_owned(),
+                id: self.id.to_string(),
                 choices,
                 created: self.created,
                 model: "model".to_owned(),
@@ -548,7 +552,7 @@ impl Inflight {
             });
 
             let mut resp = CreateChatCompletionStreamResponse {
-                id: "".to_owned(),
+                id: self.id.to_string(),
                 choices: choices.collect(),
                 created: self.created,
                 model: "".to_owned(),

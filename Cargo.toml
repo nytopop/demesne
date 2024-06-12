@@ -38,3 +38,4 @@ either = "1.12.0"
 thiserror = "1.0.61"
 num_cpus = "1.16"
 constant_time_eq = "0.3.0"
+uuid = { version = "1.8.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
