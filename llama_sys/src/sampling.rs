@@ -75,7 +75,7 @@ impl Output<Logit> {
         self.toks[i] = id;
     }
 
-    /// Apply the provided per-token logit bias.
+    /// Apply the provided per-token logit bias, maintaining sort order.
     pub fn apply_logit_bias<I: IntoIterator<Item = (Token, f32)>>(mut self, biases: I) -> Self {
         for (id, bias) in biases.into_iter() {
             let Some(i) = self.toks.iter().position(|&t| t == id) else {

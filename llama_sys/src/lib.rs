@@ -356,6 +356,16 @@ impl Tokenizer {
         self.0.token_attr(token)
     }
 
+    /// Returns true if `token` is meant to halt generation (EOS, EOT, etc)
+    pub fn token_is_eog(&self, token: Token) -> bool {
+        self.0.token_is_eog(token)
+    }
+
+    /// Returns true if `token` is a control token.
+    pub fn token_is_control(&self, token: Token) -> bool {
+        self.0.token_is_control(token)
+    }
+
     /// Returns the beginning of string token.
     pub fn token_bos(&self) -> Token {
         self.0.token_bos()
