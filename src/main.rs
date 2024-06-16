@@ -71,7 +71,7 @@ struct Opts {
 
     /// override prompt template (mis3 | l3 | phi3 | cml)
     #[structopt(short = "p", long = "prompt", name = "template", default_value = "cml")]
-    prompt: prompt::Vocab,
+    prompt: prompt::TemplateKind,
 }
 
 struct Quant(sys::ggml_type);

@@ -22,7 +22,7 @@ use rocket::tokio::task::{spawn_blocking, JoinHandle};
 use rocket::{Catcher, Request, Responder, Route, State};
 use uuid::Uuid;
 
-use super::prompt::Vocab;
+use super::prompt::{Template, TemplateKind};
 use super::radix::{Radix, RadixKv};
 
 pub fn catchers() -> Vec<Catcher> {
@@ -250,17 +250,17 @@ async fn chat_completions(
     let api = api.inner();
     let mut span = vec![api.tk.token_bos()];
 
-    let v = api.vocab;
+    // TODO: r.tools, r.tool_choice, r.parallel_tool_calls
 
     for msg in r.messages.iter() {
         match msg {
             ChatCompletionRequestMessage::System(m) => {
-                api.feed(&mut span, v.system(), &m.content);
+                api.tmpl.feed_sys(&api.tk, &mut span, &m.content);
             }
 
             ChatCompletionRequestMessage::User(m) => match &m.content {
                 ChatCompletionRequestUserMessageContent::Text(content) => {
-                    api.feed(&mut span, v.user(), content);
+                    api.tmpl.feed_user(&api.tk, &mut span, content);
                 }
 
                 ChatCompletionRequestUserMessageContent::Array(_) => {
@@ -270,17 +270,28 @@ async fn chat_completions(
 
             ChatCompletionRequestMessage::Assistant(m) => match (&m.content, &m.tool_calls) {
                 (Some(content), None) => {
-                    api.feed(&mut span, v.assistant(), content);
+                    api.tmpl.feed_gen_main(&api.tk, &mut span, content);
                 }
 
-                // TODO(tools): finish
-                (Some(_content), Some(_tools)) => {}
-                (None, Some(_tools)) => {}
+                (Some(content), Some(calls)) => {
+                    api.tmpl.feed_gen_main(&api.tk, &mut span, content);
+
+                    // TODO: actually serialize calls
+                    let tc = r#"[{"id": "1234", "name": "example", "arguments": {}}]"#;
+                    api.tmpl.feed_gen_tool(&api.tk, &mut span, tc);
+                }
+
+                (None, Some(calls)) => {
+                    // TODO: actually serialize calls
+                    let tc = r#"[{"id": "4321", "name": "example", "arguments": {}}]"#;
+                    api.tmpl.feed_gen_tool(&api.tk, &mut span, tc);
+                }
+
                 (None, None) => {}
             },
 
             ChatCompletionRequestMessage::Tool(m) => {
-                api.feed(&mut span, v.tool_out(), &m.content);
+                api.tmpl.feed_result(&api.tk, &mut span, &m.content);
             }
 
             ChatCompletionRequestMessage::Function(_) => {
@@ -292,8 +303,7 @@ async fn chat_completions(
         }
     }
 
-    // TODO(tools): we should not be adding this header yet, as we may want tool calls
-    api.prep(&mut span, v.assistant());
+    api.tmpl.prep_gen_choice(&mut span);
 
     // token limits
     let n_max = min(api.n_train, api.n_cells);
@@ -329,38 +339,48 @@ async fn chat_completions(
             .collect(),
     });
 
-    let mut p = Inflight {
-        id: Uuid::new_v4(),
+    let tools = r.tools.unwrap_or_default();
+
+    let tool_choice_default = if tools.is_empty() {
+        ChatCompletionToolChoiceOption::None
+    } else {
+        ChatCompletionToolChoiceOption::Auto
+    };
+
+    let span = Span {
         temperature: r.temperature.unwrap_or(1.),
         min_s: 1. - r.top_p.unwrap_or(1.),
         logit_bias,
-        logprobs,
-        top_logprobs,
-        stream_usage,
-
         n_infill: span.len(),
         n_infer,
-        n_actual: 0,
+        logprobs,
+        top_logprobs,
+        tool_choice: r.tool_choice.unwrap_or(tool_choice_default),
 
-        span: vec![span; n],
-        text: vec![vec![]; n],
+        span,
+        text: vec![],
         prob: vec![],
-        dirty: vec![false; n],
-        first: vec![true; n],
+        stop_automs: stop_matches.collect(),
+        stop_reason: None,
+        is_first: true,
+        is_dirty: false,
+        is_gen_c: true,
+    };
 
-        stop_matches: vec![stop_matches.collect(); n],
-        finish: vec![(n_infer == 0).then_some(FinishReason::Length); n],
-
+    let p = Completion {
+        id: Uuid::new_v4(),
         created: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap(),
+        stream_usage,
+
+        n_infill: span.n_infill,
+        n_actual: 0,
+
+        spans: vec![span; n],
         tx,
     };
-
-    if p.logprobs {
-        p.prob.resize_with(n, Default::default);
-    }
 
     api.schedule(p).await?;
 
@@ -375,141 +395,49 @@ async fn chat_completions(
     })
 }
 
-struct Inflight {
+struct Completion {
     id: Uuid,
-    temperature: f32, // softmax temperature
-    min_s: f32,       // min ratio of probability steps
-    logit_bias: Vec<(Token, f32)>,
-    logprobs: bool,
-    top_logprobs: usize,
-    stream_usage: bool,
-
-    n_infill: usize, // how much of span is infill?
-    n_infer: usize,  // max tokens to infer
-    n_actual: usize, // # tokens actually decoded (noncached)
-
-    // all of the following are indexed by span
-    span: Vec<Vec<Token>>,
-    text: Vec<Vec<u8>>,
-    prob: Vec<Vec<ChatCompletionTokenLogprob>>,
-    dirty: Vec<bool>,
-    first: Vec<bool>,
-    stop_matches: Vec<Vec<StopAutomaton>>,
-    finish: Vec<Option<FinishReason>>,
-
     created: u32,
+    stream_usage: bool,
+    n_infill: usize,
+    n_actual: usize,
+    spans: Vec<Span>,
     tx: Either<Option<ones::Sender<Json<CreateChatCompletionResponse>>>, UnboundedSender<Event>>,
 }
 
-impl Inflight {
+impl Completion {
     fn has_enabled(&self) -> bool {
-        self.finish.iter().any(|f| f.is_none())
+        self.spans.iter().any(|f| !f.is_stopped())
     }
 
     fn enabled(&self) -> impl Iterator<Item = &[Token]> {
-        iter::zip(&self.span, &self.finish)
-            .filter(|(_, e)| e.is_none())
-            .map(|(s, _)| s.as_slice())
-    }
-
-    fn accept(&mut self, ctx: &Context, logits: Output<Logit>, i: usize) {
-        assert!(self.finish[i].is_none(), "accept on disabled span?");
-
-        let prob = logits
-            .apply_logit_bias(self.logit_bias.iter().copied())
-            .softmax(self.temperature);
-
-        // if enabled, grab the top logprobs before truncating & converting the distribution
-        let top_logprobs = self
-            .logprobs
-            .then(|| prob.logprobs().take(20).collect::<Vec<_>>());
-
-        // j indexes into top_logprobs, but may be out of bounds
-        let (j, tok) = prob
-            // TODO: figure out how to pass min_p, or if we even need it
-            .trunc_k(0., self.min_s, 1)
-            .distribution()
-            .sample();
-
-        let nb = ctx.detokenize(&mut self.text[i], tok, false);
-        let n = self.text[i].len();
-
-        if ctx.model().token_is_eog(tok) {
-            self.finish[i] = Some(FinishReason::Stop);
-        } else if self.span[i].len() - self.n_infill >= self.n_infer {
-            self.finish[i] = Some(FinishReason::Length);
-        } else if nb > 0
-            && self.stop_matches[i]
-                .iter_mut()
-                .any(|a| a.feed_done(&self.text[i][n - nb..]))
-        {
-            // do not add this token to the response
-            self.finish[i] = Some(FinishReason::Stop);
-            self.text[i].truncate(n - nb);
-            return;
-        }
-
-        self.span[i].push(tok);
-        self.dirty[i] = true;
-
-        // finish computing logprobs now that we know which token was sampled
-        if let Some(top_logprobs) = top_logprobs {
-            let detok = |id| {
-                let mut bytes = Vec::with_capacity(16);
-                ctx.detokenize(&mut bytes, id, false);
-                let token = String::from_utf8_lossy(&bytes).into_owned();
-
-                (token, Some(bytes))
-            };
-
-            let (token, bytes) = detok(tok);
-
-            let tlp = ChatCompletionTokenLogprob {
-                token,
-                logprob: top_logprobs.get(j).map(|(_, lp)| *lp).unwrap_or(-9999.),
-                bytes,
-                top_logprobs: top_logprobs
-                    .into_iter()
-                    .take(self.top_logprobs)
-                    .map(|(id, lp)| (detok(id), lp))
-                    .map(|((token, bytes), logprob)| TopLogprobs { token, logprob, bytes })
-                    .collect(),
-            };
-
-            self.prob[i].push(tlp);
-        }
+        self.spans
+            .iter()
+            .filter(|s| !s.is_stopped())
+            .map(|s| s.span.as_slice())
     }
 
     fn accept_and_complete(&mut self) -> bool {
         let done = !self.has_enabled();
 
-        let mut logprobs = self
-            .prob
-            .iter_mut()
-            .map(mem::take)
-            .map(|content| ChatChoiceLogprobs { content: Some(content) });
-
-        let choices = iter::zip(self.finish.iter(), self.text.iter_mut())
-            .enumerate()
-            .map(|(i, (finish_reason, text))| (i, finish_reason, text, logprobs.next()));
+        let choices = self.spans.iter_mut().enumerate();
 
         if self.tx.is_left() && done {
             // TODO: tools
             #[allow(deprecated)]
-            let choices = choices.map(|(i, &finish_reason, text, logprobs)| ChatChoice {
+            let choices = choices.map(|(i, s)| ChatChoice {
                 index: i as u32,
                 message: ChatCompletionResponseMessage {
-                    content: Some(String::from_utf8_lossy(text).into_owned()),
+                    content: Some(String::from_utf8_lossy(&s.text).into_owned()),
                     tool_calls: None,
                     role: Role::Assistant,
                     function_call: None,
                 },
-                finish_reason,
-                logprobs,
+                finish_reason: s.stop_reason,
+                logprobs: s.take_logprobs(),
             });
 
             let choices = choices.collect();
-            drop(logprobs);
 
             // TODO: model, system_fingerprint
             let resp = CreateChatCompletionResponse {
@@ -529,14 +457,15 @@ impl Inflight {
         }
 
         if self.tx.is_right() {
-            let choices = choices.filter(|c| mem::replace(&mut self.dirty[c.0], false));
+            let choices = choices.filter(|(_, s)| s.is_dirty);
 
             #[allow(deprecated)]
-            let choices = choices.map(|(i, &finish_reason, text, logprobs)| {
-                let content = Some(String::from_utf8_lossy(text).into_owned());
-                text.clear();
+            let choices = choices.map(|(i, s)| {
+                let content = Some(String::from_utf8_lossy(&s.text).into_owned());
+                s.text.clear();
 
-                let role = mem::replace(&mut self.first[i], false).then_some(Role::Assistant);
+                let role = mem::replace(&mut s.is_first, false).then_some(Role::Assistant);
+                s.is_dirty = false;
 
                 ChatChoiceStream {
                     index: i as u32,
@@ -546,8 +475,8 @@ impl Inflight {
                         role,
                         function_call: None,
                     },
-                    finish_reason,
-                    logprobs,
+                    finish_reason: s.stop_reason,
+                    logprobs: s.take_logprobs(),
                 }
             });
 
@@ -582,19 +511,149 @@ impl Inflight {
     }
 
     fn compute_usage(&self) -> CompletionUsage {
-        let prompt_tokens = self.n_infill as u32;
-
         CompletionUsage {
-            prompt_tokens,
+            prompt_tokens: self.n_infill as u32,
 
             completion_tokens: self
-                .span
+                .spans
                 .iter()
-                .map(|s| s.len() as u32 - prompt_tokens)
+                .map(|s| s.span.len() - s.n_infill)
+                .map(|n| n as u32)
                 .sum(),
 
             total_tokens: self.n_actual as u32,
         }
+    }
+}
+
+#[derive(Clone)]
+struct Span {
+    // config
+    temperature: f32,
+    min_s: f32,
+    logit_bias: Vec<(Token, f32)>,
+    n_infill: usize,
+    n_infer: usize,
+    logprobs: bool,
+    top_logprobs: usize,
+    tool_choice: ChatCompletionToolChoiceOption,
+
+    // state
+    span: Vec<Token>,
+    text: Vec<u8>,
+    prob: Vec<ChatCompletionTokenLogprob>,
+    stop_automs: Vec<StopAutomaton>,
+    stop_reason: Option<FinishReason>,
+    is_first: bool,
+    is_dirty: bool,
+    is_gen_c: bool,
+}
+
+impl Span {
+    fn is_stopped(&self) -> bool {
+        self.stop_reason.is_some()
+    }
+
+    fn accept(&mut self, tk: &Tokenizer, tmpl: &Template, logits: Output<Logit>) {
+        assert!(!self.is_stopped(), "accept called on stopped span");
+
+        // convert to probability space after applying logit bias
+        let prob = logits
+            // TODO: apply bias for tool if tools are disabled
+            .apply_logit_bias(self.logit_bias.iter().copied())
+            .softmax(self.temperature);
+
+        // if enabled, grab the top logprobs before truncating & converting the distribution
+        let top_logprobs = self
+            .logprobs
+            .then(|| prob.logprobs().take(20).collect::<Vec<_>>());
+
+        // j is aligned w.r.t. top_logprobs, but may be out of bounds
+        let (j, tok) = prob.trunc_k(0., self.min_s, 1).distribution().sample();
+
+        if mem::replace(&mut self.is_gen_c, false) {
+            match self.tool_choice {
+                ChatCompletionToolChoiceOption::None => {
+                    tmpl.prep_gen_main(&mut self.span);
+                }
+
+                ChatCompletionToolChoiceOption::Auto => {
+                    // TODO: branch on probability of tc
+                    unimplemented!()
+                }
+
+                ChatCompletionToolChoiceOption::Required => {
+                    // TODO: we need structured generation to make this work properly
+                    tmpl.prep_gen_tool(&mut self.span);
+                }
+
+                ChatCompletionToolChoiceOption::Named(_) => {
+                    // TODO: prefill the named tool
+                    unimplemented!()
+                }
+            }
+
+            // TODO: recheck max token allowance
+            self.n_infill = self.span.len();
+
+            return;
+        }
+
+        let nb = tk.detokenize(&mut self.text, tok, false);
+        let n = self.text.len();
+
+        if tk.token_is_eog(tok) {
+            self.stop_reason = Some(FinishReason::Stop);
+        } else if self.span.len() - self.n_infill >= self.n_infer {
+            self.stop_reason = Some(FinishReason::Length);
+        } else if nb > 0 && self.feed_stop_sm(n - nb) {
+            self.stop_reason = Some(FinishReason::Stop);
+            self.text.truncate(n - nb);
+            return;
+        }
+
+        self.span.push(tok);
+        self.is_dirty = true;
+
+        // finish computing logprobs now that we know which token was sampled
+        if let Some(top_logprobs) = top_logprobs {
+            let detok = |id| {
+                let mut bytes = Vec::with_capacity(16);
+                tk.detokenize(&mut bytes, id, false);
+                let token = String::from_utf8_lossy(&bytes).into_owned();
+
+                (token, Some(bytes))
+            };
+
+            let (token, bytes) = detok(tok);
+
+            let tlp = ChatCompletionTokenLogprob {
+                token,
+                logprob: top_logprobs.get(j).map(|(_, lp)| *lp).unwrap_or(-9999.),
+                bytes,
+                top_logprobs: top_logprobs
+                    .into_iter()
+                    .take(self.top_logprobs)
+                    .map(|(id, lp)| (detok(id), lp))
+                    .map(|((token, bytes), logprob)| TopLogprobs { token, logprob, bytes })
+                    .collect(),
+            };
+
+            self.prob.push(tlp);
+        }
+    }
+
+    fn feed_stop_sm(&mut self, at: usize) -> bool {
+        let buf = &self.text[at..];
+        self.stop_automs.iter_mut().any(|a| a.feed_done(buf))
+    }
+
+    fn take_logprobs(&mut self) -> Option<ChatChoiceLogprobs> {
+        let prob = mem::take(&mut self.prob);
+
+        (!prob.is_empty())
+            .then_some(prob)
+            .map(|content| ChatChoiceLogprobs { content: Some(content) })
     }
 }
 
@@ -640,14 +699,14 @@ pub enum LoadError {
 
 pub struct ApiBuilder {
     path: PathBuf,
-    vocab: Vocab,
+    vocab: TemplateKind,
     m_param: Option<ModelParams>,
     c_param: Option<ContextParams>,
     api_key: Option<String>,
 }
 
 impl ApiBuilder {
-    pub fn new<P: Into<PathBuf>>(path: P, vocab: Vocab) -> Self {
+    pub fn new<P: Into<PathBuf>>(path: P, vocab: TemplateKind) -> Self {
         Self {
             path: path.into(),
             m_param: None,
@@ -680,6 +739,8 @@ impl ApiBuilder {
         let mut ctx = model.context(c).ok_or(LoadError::LoadContext)?;
         let tk = model.tokenizer();
 
+        let tmpl = Arc::new(Template::compile(&tk, self.vocab));
+
         let (queue, rx) = mpsc::channel(32);
 
         let n_train = model.n_ctx_train();
@@ -688,6 +749,8 @@ impl ApiBuilder {
 
         let inner = Arc::new(Mutex::new(Inner {
             ctx,
+            tk: tk.clone(),
+            tmpl: tmpl.clone(),
             n_batch: c.n_batch as usize,
             queue: rx,
             sched: vec![],
@@ -698,39 +761,27 @@ impl ApiBuilder {
             queue,
             inner,
             tk,
+            tmpl,
             n_train,
             n_cells,
             api_key: self.api_key,
-            vocab: self.vocab,
         })
     }
 }
 
 pub struct Api {
-    queue: mpsc::Sender<Inflight>,
+    queue: mpsc::Sender<Completion>,
     inner: Arc<Mutex<Inner>>,
     tk: Tokenizer,
+    tmpl: Arc<Template>,
     n_train: usize,
     n_cells: usize,
     api_key: Option<String>,
-    vocab: Vocab,
 }
 
 impl Api {
-    /// Feed a closed header into buf.
-    fn feed(&self, buf: &mut Vec<Token>, h: [&str; 2], text: &str) {
-        self.tk.tokenize(buf, h[0], true);
-        self.tk.tokenize(buf, text, false);
-        self.tk.tokenize(buf, h[1], true);
-    }
-
-    /// Feed an open header into buf.
-    fn prep(&self, buf: &mut Vec<Token>, h: [&str; 2]) {
-        self.tk.tokenize(buf, h[0], true);
-    }
-
     /// Schedule an inflight completion req.
-    async fn schedule(&self, params: Inflight) -> Result<JoinHandle<()>, ErrorResp> {
+    async fn schedule(&self, params: Completion) -> Result<JoinHandle<()>, ErrorResp> {
         let mut jobs = self.queue.clone();
 
         jobs.send(params)
@@ -746,14 +797,17 @@ impl Api {
 
 struct Inner {
     ctx: Context,
+    tk: Tokenizer,
+    tmpl: Arc<Template>,
     n_batch: usize,
-    queue: mpsc::Receiver<Inflight>,
-    sched: Vec<Inflight>,
+    queue: mpsc::Receiver<Completion>,
+    sched: Vec<Completion>,
     cache: RadixKv,
 }
 
 impl Inner {
     fn flush_all(mu: Arc<Mutex<Self>>) -> Result<(), llama_sys::Error> {
+        // excludes to a single task, but serves all inflight reqs so contention isn't an issue
         while !{
             let mut ex = mu.lock().unwrap();
             ex.flush_bounded()?;
@@ -766,6 +820,8 @@ impl Inner {
     // TODO: use tracing to record performance data
 
     fn flush_bounded(&mut self) -> Result<(), llama_sys::Error> {
+        let t0 = std::time::Instant::now();
+
         // move any new requests to the back of scheduled queue
         while let Ok(Some(p)) = self.queue.try_next() {
             self.sched.push(p);
@@ -818,6 +874,7 @@ impl Inner {
 
         // decode w/e spans are marked as cold
         let batch = self.cache.pending_batch();
+        let nb = batch.len();
 
         if !batch.is_empty() {
             let evals = self.ctx.decode(&batch)?;
@@ -826,50 +883,57 @@ impl Inner {
                 .accept_batch(evals.into_iter().map(|o| o.unwrap()));
         }
 
-        // dispatch logits to any running spans that are fully infilled
         let mut gc = vec![];
 
+        // dispatch logits to any running spans that are fully infilled
         for (i, p) in sched.iter_mut().enumerate() {
             let mut touched = false;
             let mut n_ready = 0;
 
-            for j in 0..p.span.len() {
-                if p.finish[j].is_some() {
+            // TODO: remove hard dep
+            for s in p.spans.iter_mut() {
+                if s.is_stopped() {
                     n_ready += 1;
                     continue;
                 }
 
-                let span = &p.span[j];
-                let a = self.cache.ancestor(span);
+                let a = self.cache.ancestor(&s.span);
 
-                if a.n < span.len() {
+                if a.n < s.span.len() {
                     continue;
                 }
 
                 // sanity check
-                assert_eq!(a.n, span.len());
+                assert_eq!(a.n, s.span.len());
                 assert_eq!(self.cache[a.i].tokens.len(), self.cache[a.i].logits.len(),);
 
                 let logits = self.cache[a.i].logits[a.k - 1].clone();
-                p.accept(&self.ctx, logits, j);
-
+                s.accept(&self.tk, &self.tmpl, logits);
                 touched = true;
             }
 
-            if (touched && p.accept_and_complete()) || n_ready == p.span.len() {
+            if (touched && p.accept_and_complete()) || n_ready == p.spans.len() {
                 gc.push(i);
             }
         }
+
+        let nd = gc.len();
 
         for i in gc.into_iter().rev() {
             self.sched.remove(i);
         }
 
+        println!(
+            "flush_bounded: {nb} toks, {nd} completed, {} queued, in {:?}",
+            self.sched.len(),
+            t0.elapsed(),
+        );
+
         Ok(())
     }
 }
 
-fn n_dedup_reqs_within(mut left: usize, sched: &[Inflight]) -> usize {
+fn n_dedup_reqs_within(mut left: usize, sched: &[Completion]) -> usize {
     let mut plan = Radix::new();
     let mut k = 0; // # of reqs that fit
 
