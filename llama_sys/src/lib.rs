@@ -4,6 +4,8 @@ use std::ptr::{self, copy_nonoverlapping};
 use std::slice;
 use std::sync::{Arc, Once};
 
+use bitflags::bitflags;
+
 #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
 #[allow(rustdoc::bare_urls)]
 pub mod sys {
@@ -352,7 +354,7 @@ impl Tokenizer {
         self.0.n_vocab()
     }
 
-    pub fn token_attr(&self, token: Token) -> sys::llama_token_attr {
+    pub fn token_attr(&self, token: Token) -> Attr {
         self.0.token_attr(token)
     }
 
@@ -407,6 +409,25 @@ impl Tokenizer {
     /// Returns the end of infill middle token (codellama).
     pub fn token_eot(&self) -> Token {
         self.0.token_eot()
+    }
+}
+
+bitflags! {
+    #[derive(Debug)]
+    pub struct Attr: sys::llama_token_attr {
+        const UNDEFINED    = sys::llama_token_attr_LLAMA_TOKEN_ATTR_UNDEFINED;
+        const UNKNOWN      = sys::llama_token_attr_LLAMA_TOKEN_ATTR_UNKNOWN;
+        const UNUSED       = sys::llama_token_attr_LLAMA_TOKEN_ATTR_UNUSED;
+        const NORMAL       = sys::llama_token_attr_LLAMA_TOKEN_ATTR_NORMAL;
+        const CONTROL      = sys::llama_token_attr_LLAMA_TOKEN_ATTR_CONTROL;
+        const USER_DEFINED = sys::llama_token_attr_LLAMA_TOKEN_ATTR_USER_DEFINED;
+        const BYTE         = sys::llama_token_attr_LLAMA_TOKEN_ATTR_BYTE;
+        const NORMALIZED   = sys::llama_token_attr_LLAMA_TOKEN_ATTR_NORMALIZED;
+        const LSTRIP       = sys::llama_token_attr_LLAMA_TOKEN_ATTR_LSTRIP;
+        const RSTRIP       = sys::llama_token_attr_LLAMA_TOKEN_ATTR_RSTRIP;
+        const SINGLE_WORD  = sys::llama_token_attr_LLAMA_TOKEN_ATTR_SINGLE_WORD;
+
+        const _ = !0;
     }
 }
 
@@ -595,8 +616,10 @@ impl Model {
         unsafe { sys::llama_model_size(self.0) }
     }
 
-    pub fn token_attr(&self, token: Token) -> sys::llama_token_attr {
-        unsafe { sys::llama_token_get_attr(self.0, token) }
+    pub fn token_attr(&self, token: Token) -> Attr {
+        let bits = unsafe { sys::llama_token_get_attr(self.0, token) };
+
+        Attr::from_bits(bits).unwrap()
     }
 
     /// Returns true if `token` is meant to halt generation (EOS, EOT, etc)

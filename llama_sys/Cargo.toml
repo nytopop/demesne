@@ -24,3 +24,4 @@ bindgen = "0.69.4"
 [dependencies]
 thiserror = "1.0.61"
 rand = "0.8.5"
+bitflags = "2.5.0"
